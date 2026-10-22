@@ -63,6 +63,26 @@ def clean_json_string(json_str: str) -> str:
     return json_str
 
 
+from html import escape as _html_escape
+
+TG_LIMIT = 4000   # Telegram hard limit is 4096 characters per message
+
+def format_question_message(number, total, question, options=None, max_option_len=100):
+    head = f"<b>{number}/{total}</b>\n\n"
+    q = question or ""
+    opt_lines, shown = "", []
+    if options and any(len(o) > max_option_len for o in options):
+        shown = [o if len(o) <= 400 else o[:397] + "..." for o in options]
+        opt_lines = "\n\n" + "\n".join(
+            f"<b>{chr(65 + i)})</b> {_html_escape(o)}" for i, o in enumerate(shown))
+    visible_extra = len(f"{number}/{total}\n\n") + (
+        len("\n\n" + "\n".join(f"{chr(65 + i)}) {o}" for i, o in enumerate(shown))) if opt_lines else 0)
+    room = max(TG_LIMIT - visible_extra, 500)
+    if len(q) > room:
+        q = q[:room - 3] + "..."
+    return f"{head}{_html_escape(q)}{opt_lines}"
+
+
 async def get_validation_error_message(user_id: str, validation_reason: str) -> str:
     from src.user_management import get_user_language
 
@@ -534,18 +554,15 @@ def truncate_text(text: str, max_length: int = 99) -> str:
     return text[:max_length-3].strip() + "..."
 
 def create_telegram_poll(question: Dict) -> Dict:
-    truncated_question = truncate_text(question["question"], 300)
-    
-    truncated_options = [truncate_text(opt, 99) for opt in question["options"]]
-    
-    correct_answer = truncate_text(question["correct_answer"], 99)
-    correct_option_id = truncated_options.index(correct_answer)
-    
+    from src.poll_utils import poll_options
+    options = question["options"]
+    ca = question["correct_answer"]
+    correct_option_id = ca if isinstance(ca, int) else options.index(ca)
     return {
-        "question": truncated_question,
-        "options": truncated_options,
+        "question": truncate_text(question["question"], 300),
+        "options": poll_options(options),
         "is_anonymous": False,
         "type": "quiz",
         "correct_option_id": correct_option_id,
-        "explanation": f"Correct answer: {question['correct_answer']}"
+        "explanation": f"Correct answer: {options[correct_option_id]}"[:200],
     }

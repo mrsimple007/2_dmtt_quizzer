@@ -40,7 +40,36 @@ def _md_escape(text: str) -> str:
     return (text.replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*")
                 .replace("`", "\\`").replace("[", "\\[").replace("]", "\\]"))
 
+from telegram import ReplyKeyboardRemove
+from telegram.ext import ApplicationHandlerStop
+from src.imports import is_free_user
 
+
+async def free_users_only_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Non-free users get the welcome message only. Everything else is blocked."""
+    user = update.effective_user
+    if user is None or update.my_chat_member or is_free_user(user.id):
+        return  # let it through
+
+    try:
+        if update.callback_query:
+            await update.callback_query.answer()      # just stop the spinner
+        elif update.message and update.effective_chat.type == "private":
+            from handlers.start_handler import MAIN_MENU_TRANSLATIONS, sanitize_name
+            lang = (user.language_code or "uz")[:2]
+            if lang not in MAIN_MENU_TRANSLATIONS:
+                lang = "uz"
+            text = MAIN_MENU_TRANSLATIONS[lang]["welcome_message"].format(
+                name=sanitize_name(user.first_name))
+            await update.message.reply_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ReplyKeyboardRemove(),   # removes old menu buttons
+            )
+    except Exception as e:
+        logger.warning(f"[GATE] failed for {user.id}: {e}")
+
+    raise ApplicationHandlerStop   # nothing else runs for this update
 
 
 def _language_keyboard() -> InlineKeyboardMarkup:
@@ -2103,7 +2132,8 @@ def main() -> None:
     from handlers.my_quizzes_handlers import handle_quiz_time_menu, handle_quiz_time_set
     application.add_handler(CallbackQueryHandler(handle_quiz_time_menu, pattern=r"^qt_menu_"))
     application.add_handler(CallbackQueryHandler(handle_quiz_time_set, pattern=r"^qt_set_"))
-
+    application.add_handler(TypeHandler(Update, free_users_only_gate), group=-2)
+    application.add_handler(TypeHandler(Update, touch_user), group=-1)   # existing line
 
     setup_payment_handlers(application)
     setup_share_handlers(application)

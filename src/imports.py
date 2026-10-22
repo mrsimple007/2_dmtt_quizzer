@@ -17,10 +17,7 @@ FREE_USER_IDS = {int(x) for x in os.environ.get("FREE_USER_IDS", "").replace(" "
 
 
 def is_free_user(user_id) -> bool:
-    try:
-        return int(user_id) in FREE_USER_IDS
-    except (TypeError, ValueError):
-        return False
+    return str(user_id) in {str(x) for x in FREE_USER_IDS}
 
 
 from telegram import (
@@ -99,9 +96,6 @@ NOTIFICATION_ADMIN_IDS = [
     # 999932510,
     # 8126290272  # MR 2
 ]
-
-
-FREE_USER_IDS = {"8498397733"}
 
 ADMIN_USERNAME= "@SimpleLearn_main_admin"
 ADMIN_CHAT_ID="8437026582" #MR - main admin

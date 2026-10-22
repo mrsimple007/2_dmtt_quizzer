@@ -1,1462 +1,503 @@
+"""
+quiz_splitter.py
+================
+Parser for attestation-style test files (MTT / DMTT).
+
+Public API (kept compatible with handlers/quiz_split_handlers.py):
+
+    QuizSplitter.parse_quiz_file(content, correct_marker='#') -> list[dict]
+    QuizSplitter.get_split_options()                          -> list[int]
+    QuizSplitter.calculate_batches(total, size)               -> (num_batches, last_batch_size)
+    QuizSplitter.split_quizzes(quizzes, size)                 -> list[list[dict]]
+    validate_quiz_structure(quiz)                             -> bool
+
+Every parsed quiz is a dict:
+
+    {
+        "question": str,                 # full text (scenario / matching lists included)
+        "options": [str, ...],           # option letters "A)" are STRIPPED -> shuffling is safe
+        "correct_answer": int | None,    # index into options (None = answer not found)
+        "allows_multiple_answers": False,
+    }
+
+Supported layouts (all can be mixed in one file):
+
+  1. "N. Question?"  A) B) C) D)  + "✅ Javob: X"                       (DMTT best-answer)
+  2. "Savol: ..." + concepts + "a) b) c) d)" + "A) 1-d, 2-c ..." + ✅    (matching)
+  3. "N-SAVOL" / scenario / "Savol: ..." / A) B) C) D) / "To'g'ri javob: X"  (situational)
+  4. "NN. Test type name" / stem / A) B) C) D) / "Javob: X"             (pasted 5-type format)
+  5. Sequence tests: options like "2-3-4-1"
+  6. "N-test" / "Savol:" / "Tushunchalar:" / "Mazmunlar:" / "Javob variantlari:"
+     with the correct option marked by a leading arrow:  "► C) 1-b, 2-a, 3-c"
+
+The correct answer is taken from either an answer line ("Javob: X",
+"To'g'ri javob: X", with or without ✅) or from a marker (✅ ✔ ☑ ✓ ► ▶ ➤ ...) placed
+in front of / behind the option itself.
+"""
+
 import logging
-from typing import List, Dict, Tuple
+import math
 import re
-import random
-from docx import Document
+from typing import Dict, List, Optional, Tuple
+
 logger = logging.getLogger(__name__)
 
+MAX_POLL_QUESTION = 300   # Telegram poll limits (informational, used for stats only)
+MAX_POLL_OPTION = 100
+
+# --------------------------------------------------------------------------- #
+#  Character helpers
+# --------------------------------------------------------------------------- #
+_AP = "'’ʻʼ‘`´ʹ"                      # every apostrophe variant seen in Uzbek text
+_MARKS = "✅✔✔️☑✓\ufe0f►▶▸➤➜➔"           # "correct" markers
+_RE_MARKS = re.compile("[" + _MARKS + "]")
+_RE_LEAD_MARK = re.compile("^[\\s" + _MARKS + "]+")      # markers standing in front of a line
+
+# Cyrillic look-alikes that people type by accident in "А) В) С)"
+_CYR = {"А": "A", "В": "B", "С": "C", "Е": "E", "а": "a", "с": "c", "е": "e"}
 
 
-
-class QuizSplitter:    
-    @staticmethod
-    def parse_quiz_file(content: str, correct_marker: str = '#') -> List[Dict]:
-        """
-        Parse quiz file with support for multiple formats.
-        Tries all applicable parsers and returns the best result.
-        """
-        all_results = []
-
-        
-        # 1. Check for Uzbek/separator format FIRST (before cleaning)
-        if '====' in content:
-            separator_count = content.count('====')
-            if separator_count >= 3:
-                logger.info("[PARSER] Trying separator format (====)")
-                quizzes = QuizSplitter._parse_separator_format(content, correct_marker)
-                if len(quizzes) > 0:
-                    all_results.append(('separator', quizzes))
-                    logger.info(f"[PARSER] Separator format: {len(quizzes)} quizzes")
-        
-        # Check for Uzbek format with ++++ separators
-        if '++++' in content or '\n++++\n' in content:
-            logger.info("[PARSER] Trying Uzbek separator format (====, ++++)")
-            quizzes = QuizSplitter._parse_uzbek_format(content, correct_marker)
-            if len(quizzes) > 0:
-                all_results.append(('uzbek', quizzes))
-                logger.info(f"[PARSER] Uzbek format: {len(quizzes)} quizzes")
-        
-        # 2. Check for question mark format (BEFORE cleaning)
-        if re.search(r'^\?', content, re.MULTILINE):
-            logger.info("[PARSER] Trying question mark format")
-            quizzes = QuizSplitter._parse_question_mark_format(content)
-            if len(quizzes) > 0:
-                all_results.append(('question_mark', quizzes))
-                logger.info(f"[PARSER] Question mark format: {len(quizzes)} quizzes")
-        
-        # 3. **NEW** Check for plus/minus format (BEFORE cleaning to preserve #)
-        if re.search(r'^#\s*.+', content, re.MULTILINE) or re.search(r'^[+-]\s*\w+', content, re.MULTILINE):
-            logger.info("[PARSER] Trying plus/minus format")
-            quizzes = QuizSplitter._parse_plus_minus_format(content)  # Use RAW content!
-            if len(quizzes) > 0:
-                all_results.append(('plus_minus', quizzes))
-                logger.info(f"[PARSER] Plus/minus format: {len(quizzes)} quizzes")        
-        # NOW clean for other formats
-        content_cleaned = QuizSplitter._clean_content(content)
-        logger.info("[DEBUG] CLEANED CONTENT SAMPLE:")
-        logger.info(content_cleaned[:1000])
-        
-        # 4. Lettered options format
-        if re.search(r'^\d+\.\s+.+?\n[A-E]\)', content_cleaned, re.MULTILINE | re.DOTALL):
-            logger.info("[PARSER] Trying lettered options format")
-            quizzes = QuizSplitter._parse_lettered_options_format(content_cleaned)
-            if len(quizzes) > 0:
-                all_results.append(('lettered', quizzes))
-                logger.info(f"[PARSER] Lettered format: {len(quizzes)} quizzes")
-
-        # INLINE must be detected on RAW content
-        INLINE_OPTIONS_DETECTOR = r'^[^\n]+\n\s*[A-E]\)\s*.+?(?:\s+[A-E]\)\s*.+?)+'
-        if re.search(INLINE_OPTIONS_DETECTOR, content, re.MULTILINE | re.DOTALL):
-            logger.info("[PARSER] Trying inline options format")
-            quizzes = QuizSplitter._parse_inline_options_format(content)
-            if quizzes:
-                all_results.append(('inline_options', quizzes))
-
-        logger.info(
-            f"[DEBUG] Inline detector match: "
-            f"{bool(re.search(INLINE_OPTIONS_DETECTOR, content_cleaned, re.MULTILINE | re.DOTALL))}"
-        )
+def _norm_letter(ch: str) -> str:
+    return _CYR.get(ch, ch)
 
 
-        # 5. Excel/TSV format
-        if '\t' in content_cleaned:
-            first_line = content_cleaned.split('\n')[0]
-            tab_count = first_line.count('\t')
-            if tab_count >= 3:
-                logger.info("[PARSER] Trying Excel/TSV format")
-                quizzes = QuizSplitter._parse_excel_format(content_cleaned)
-                if len(quizzes) > 0:
-                    all_results.append(('excel', quizzes))
-                    logger.info(f"[PARSER] Excel/TSV format: {len(quizzes)} quizzes")
-        
-        # 6. Table format
-        if '|' in content_cleaned and (re.search(r'\d+\s*\|', content_cleaned) or re.search(r'[A-F]\s*\|', content_cleaned)):
-            logger.info("[PARSER] Trying table format")
-            quizzes = QuizSplitter._parse_table_format(content_cleaned)
-            if len(quizzes) > 0:
-                all_results.append(('table', quizzes))
-                logger.info(f"[PARSER] Table format: {len(quizzes)} quizzes")
-        
-        # 7. Moodle percentage format
-        if re.search(r'\d+\.\s*.+?\{~%\d+%', content_cleaned, re.DOTALL):
-            logger.info("[PARSER] Trying Moodle percentage format")
-            quizzes = QuizSplitter._parse_moodle_percentage_format(content_cleaned)
-            if len(quizzes) > 0:
-                all_results.append(('moodle', quizzes))
-                logger.info(f"[PARSER] Moodle format: {len(quizzes)} quizzes")
-        
-        # 8. Standard format (fallback)
-        logger.info("[PARSER] Trying standard format")
-        quizzes = QuizSplitter._parse_standard_format(content_cleaned, correct_marker)
-        if len(quizzes) > 0:
-            all_results.append(('standard', quizzes))
-            logger.info(f"[PARSER] Standard format: {len(quizzes)} quizzes")
-        
-        # Pick the best result (most quizzes with valid structure)
-        if not all_results:
-            logger.warning("[PARSER] No parsers succeeded")
+def _strip_marks(text: str) -> Tuple[str, bool]:
+    found = bool(_RE_MARKS.search(text))
+    return _RE_MARKS.sub("", text).strip(), found
+
+
+# --------------------------------------------------------------------------- #
+#  Regular expressions
+# --------------------------------------------------------------------------- #
+# "Javob: A", "✅ Javob: A", "To'g'ri javob: A", "To‘g‘ri javob – A"
+_RE_ANS = re.compile(
+    r"^\W*(?:to[" + _AP + r"]?g[" + _AP + r"]?ri\s+)?javob\s*[:：\-–—]\s*\(?\s*([A-Fa-fАВСЕасе])\b",
+    re.IGNORECASE,
+)
+
+# Options use CAPITAL letters, matching items use lowercase.  "." is only accepted
+# when followed by whitespace (protects "e.g." and initials).
+_RE_OPT = re.compile(r"^\(?\s*([A-FАВСЕ])\s*([\)\]]|\.(?=\s))\s*(.*)$")
+_RE_ITEM = re.compile(r"^\(?\s*([a-fасе])\s*([\)\]]|\.(?=\s))\s*(.*)$")
+
+_RE_SAVOL = re.compile(r"^\s*savol\s*\d*\s*[:：]\s*(.*)$", re.IGNORECASE)
+_RE_NSAVOL = re.compile(r"^\s*(\d{1,4})\s*[-–.]?\s*savol\s*[:.]?\s*$", re.IGNORECASE)      # "31-SAVOL"
+_RE_NTEST = re.compile(r"^\s*(\d{1,4})\s*[-–]\s*test\s*$", re.IGNORECASE)                  # "13-test" (noise)
+_RE_TYPE_HDR = re.compile(                                                                 # "12. Murakkab moslashtirish testi"
+    r"^\s*(\d{1,4})\s*[\.\)]\s*([^?:]{3,70}?\btest(?:i)?)\s*$", re.IGNORECASE)
+_RE_NUMQ = re.compile(r"^\s*(\d{1,4})\s*[\.\)]\s+(\S.*)$")                                 # "7. Question?"
+_RE_LABEL = re.compile(r"^[^\W\d][^:]{1,38}:$")                                            # "Mazmunlar:"
+_RE_GLUED_LABEL = re.compile(
+    r"\s+(tu[sh]?h?unchalar|kompetensiyalar|tamoyillar|bosqichlar|jarayonlar|atamalar)\s*:\s*$",
+    re.IGNORECASE)
+
+_RE_PAIRS_NOISE = re.compile(r"^(?:\d\s*[-–—]\s*[a-fA-F]\s*[,;]?\s*){3,}$")                # stray "1-d, 2-a, 3-b, 4-c"
+_RE_MATCH_OPT = re.compile(r"^\d\s*[-–—]\s*[a-fA-F](?:\s*[,;]?\s*\d\s*[-–—]\s*[a-fA-F])+$")  # option of a matching test
+_RE_SEQ_OPT = re.compile(r"^\d(?:\s*[-–—→>,;]\s*\d){2,}$")                                 # option of a sequence test "2–3–4–1"
+_RE_VARIANTS = re.compile(r"^javob\s+variantlari\s*:?$|^variantlar\s*:?$", re.IGNORECASE)
+_RE_PATH = re.compile(r"(/Users/|Library/Containers|^\S+\.docx?$)", re.IGNORECASE)
+_RE_FILLER = re.compile(r"^[-=+_*~#.\s]{3,}$")
+
+_KNOWN_LABELS = {
+    "tushunchalar", "tuhunchalar", "mazmunlar", "tavsiflar", "natijalar", "kompetensiyalar",
+    "tamoyillar", "bosqichlar", "jarayonlar", "atamalar", "mazmuni", "xususiyatlar",
+}
+_RE_LIST_INTRO = re.compile(r"moslashtir|joylashtir|tartib|ketma-ket", re.IGNORECASE)
+
+
+# --------------------------------------------------------------------------- #
+#  Internal block (one question while it is being collected)
+# --------------------------------------------------------------------------- #
+class _Block:
+    __slots__ = ("parts", "items", "options", "correct", "ans_letter",
+                 "closed", "num", "last_listed")
+
+    def __init__(self, num: Optional[int] = None):
+        self.parts: List[Tuple[str, str]] = []   # (kind, text): text | savol | list | label
+        self.items: List[str] = []               # lowercase a) b) c) d) items (matching tests)
+        self.options: List[str] = []             # A) B) C) D) option texts
+        self.correct: Optional[int] = None       # from a marker on an option
+        self.ans_letter: Optional[str] = None    # from "Javob: X"
+        self.closed = False                      # answer line already consumed
+        self.num = num
+        self.last_listed: Optional[int] = None   # last typed "1. 2. 3." concept number
+
+
+# --------------------------------------------------------------------------- #
+#  QuizSplitter
+# --------------------------------------------------------------------------- #
+class QuizSplitter:
+    last_warnings: List[str] = []
+    last_stats: Dict[str, int] = {}
+
+    # ------------------------------ public API ------------------------------ #
+    @classmethod
+    def parse_quiz_file(cls, content: str, correct_marker: str = "#") -> List[Dict]:
+        cls.last_warnings = []
+        cls.last_stats = {"questions": 0, "long_questions": 0, "long_options": 0, "no_answer": 0}
+        try:
+            return cls._parse(content or "", correct_marker or "")
+        except Exception as e:  # never crash the bot because of a weird file
+            logger.error(f"[QuizSplitter] parse failed: {e}", exc_info=True)
             return []
-        
-        # Score each result: count valid quizzes (2+ options, has correct answer)
-        best_format = None
-        best_score = 0
-        best_quizzes = []
-        
-        for format_name, quizzes in all_results:
-            valid_count = sum(1 for q in quizzes 
-                            if len(q.get('options', [])) >= 2 
-                            and len(q.get('options', [])) <= 20  # Reasonable limit
-                            and (q.get('correct_answer') is not None or q.get('correct_answers') is not None))
-            
-            logger.info(f"[PARSER] {format_name}: {len(quizzes)} total, {valid_count} valid")
-            
-            if valid_count > best_score:
-                best_score = valid_count
-                best_format = format_name
-                best_quizzes = quizzes
-        
-        logger.info(f"[PARSER] ✅ Selected format: {best_format} with {best_score} valid quizzes")
-        return best_quizzes
-        
-    @staticmethod
-    def _is_question_line(line: str) -> bool:
-        """
-        Question can start with:
-        - #
-        - 1.
-        - 12.
-        - 1)
-        - ?
-        """
-        return (
-            line.startswith('?') or
-            line.startswith('#') or
-            re.match(r'^\d+[\.\)]\s*', line) is not None
-        )
-
-    @staticmethod
-    def extract_text_with_bold_markers(docx_path):
-        """Extract text from DOCX and mark bold text"""
-        doc = Document(docx_path)
-        content = []
-        
-        for para in doc.paragraphs:
-            line_parts = []
-            for run in para.runs:
-                text = run.text
-                if run.bold:
-                    # Mark bold text so parser can detect it
-                    text = f"#{text}"
-                line_parts.append(text)
-            
-            if line_parts:
-                content.append(''.join(line_parts))
-        
-        return '\n'.join(content)
-
-    @staticmethod
-    def _parse_inline_options_format(content: str) -> List[Dict]:
-        """
-        Parse inline options format where options appear on the same line or next line.
-        Handles both single-line and multi-line variants.
-        """
-        quizzes = []
-        lines = [l.strip() for l in content.splitlines() if l.strip()]
-        
-        logger.info(f"[INLINE PARSER] Total lines to process: {len(lines)}")
-
-        # Pattern for inline options (both upper and lowercase, more flexible)
-        INLINE_OPTION_PATTERN = r'([A-Ea-e])\)\s*(.+?)(?=\s+[A-Ea-e]\)|$)'
-        
-        # Pattern for multi-line separated options (one per line, case-insensitive)
-        SEPARATED_OPTION_PATTERN = r'^([A-Ea-e])\)?\s*(.+)$'
-        
-        # Pattern for capitalized single-word options (Goes, Have, Plays, etc.)
-        SINGLE_WORD_OPTION_PATTERN = r'^([A-E])\)\s*([A-Z][a-z]+|[A-Z]+|--|[\w\s\-/]+)$'
-
-        i = 0
-        question_count = 0
-        skipped_count = 0
-        
-        while i < len(lines):
-            current_line = lines[i]
-            
-            # Skip header/separator lines
-            if re.match(r'^[\+\-=\|]{3,}$', current_line):
-                i += 1
-                continue
-            
-            # Skip lines that are likely headers
-            if any(keyword in current_line.lower() for keyword in 
-                ['fakultet', 'kafedra', 'test', 'variant', 'respublik', 'vazirligi', 'kelishildi']):
-                i += 1
-                continue
-            
-            # Skip very short lines that can't be questions
-            if len(current_line) <= 2:
-                i += 1
-                continue
-            
-            # Check if this line starts with a question number OR is just a question
-            question_num_match = re.match(r'^(\d+)\.\s*(.+)', current_line)
-            
-            # Also handle lines that might be questions without numbers
-            if question_num_match:
-                question_num = question_num_match.group(1)
-                question_text = question_num_match.group(2).strip()
-            else:
-                # Check if this could be a question (doesn't start with option letter)
-                if not re.match(r'^[A-Ea-e]\)\s*', current_line):
-                    question_num = "unnumbered"
-                    question_text = current_line.strip()
-                else:
-                    i += 1
-                    continue
-            
-            # CASE 1: Question and options on same line
-            option_matches = list(re.finditer(INLINE_OPTION_PATTERN, question_text))
-            
-            if option_matches and len(option_matches) >= 2:
-                first_option_pos = option_matches[0].start()
-                pure_question = question_text[:first_option_pos].strip()
-                options = [m.group(2).strip() for m in option_matches]
-                
-                if len(pure_question) >= 2 or pure_question == "":  # Allow empty question if we have options
-                    # If question is empty, use placeholder
-                    if not pure_question:
-                        pure_question = f"Question {question_num}"
-                    
-                    quizzes.append({
-                        'question': pure_question,
-                        'options': options,
-                        'correct_answer': 0
-                    })
-                    question_count += 1
-                    logger.debug(f"[INLINE] Q{question_num}: Same line format, {len(options)} options")
-                i += 1
-                continue
-            
-            # CASE 2: Options on next line(s)
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                
-                # Sub-case A: Inline options on next line
-                inline_matches = list(re.finditer(INLINE_OPTION_PATTERN, next_line))
-                
-                if inline_matches and len(inline_matches) >= 2:
-                    options = [m.group(2).strip() for m in inline_matches]
-                    
-                    if len(question_text) >= 1:  # More lenient - allow 1 char questions
-                        quizzes.append({
-                            'question': question_text,
-                            'options': options,
-                            'correct_answer': 0
-                        })
-                        question_count += 1
-                        logger.debug(f"[INLINE] Q{question_num}: Next line inline, {len(options)} options")
-                    i += 2
-                    continue
-                
-                # Sub-case B: Separated options (one per line)
-                elif re.match(SEPARATED_OPTION_PATTERN, next_line):
-                    options = []
-                    j = i + 1
-                    expected_letter = 'A'
-                    
-                    while j < len(lines) and j < i + 10:
-                        line = lines[j].strip()
-                        option_match = re.match(SEPARATED_OPTION_PATTERN, line)
-                        
-                        if option_match:
-                            letter = option_match.group(1).upper()
-                            option_text = option_match.group(2).strip()
-                            
-                            # Be more flexible - allow any letter sequence
-                            if ord(letter) >= ord('A') and ord(letter) <= ord('E'):
-                                options.append(option_text)
-                                j += 1
-                            else:
-                                break
-                        else:
-                            break
-                    
-                    if len(options) >= 2 and len(question_text) >= 1:
-                        quizzes.append({
-                            'question': question_text,
-                            'options': options,
-                            'correct_answer': 0
-                        })
-                        question_count += 1
-                        logger.debug(f"[INLINE] Q{question_num}: Separated format, {len(options)} options")
-                        i = j
-                        continue
-            
-            # CASE 3: Check if the question text itself contains a letter pattern like "A. Her B) He's C) She D) We"
-            # This handles cases like question 4 in the document
-            letter_pattern_match = re.search(r'\b([A-E])\.\s*(.+?)(?:\s+([A-E])\)|\s+([A-E])\.|$)', question_text)
-            if letter_pattern_match:
-                # Try to extract options using both .) and ) patterns
-                modified_pattern = r'([A-E])[\.\)]\s*([^A-E]+?)(?=\s*[A-E][\.\)]|$)'
-                letter_matches = list(re.finditer(modified_pattern, question_text))
-                
-                if len(letter_matches) >= 2:
-                    # Find where options start
-                    first_match_pos = letter_matches[0].start()
-                    pure_question = question_text[:first_match_pos].strip()
-                    options = [m.group(2).strip() for m in letter_matches]
-                    
-                    if options:
-                        if not pure_question:
-                            pure_question = f"Question {question_num}"
-                        
-                        quizzes.append({
-                            'question': pure_question,
-                            'options': options,
-                            'correct_answer': 0
-                        })
-                        question_count += 1
-                        logger.debug(f"[INLINE] Q{question_num}: Letter pattern format, {len(options)} options")
-                    i += 1
-                    continue
-            
-            # If we reach here, question was numbered/identified but no valid options found
-            skipped_count += 1
-            i += 1
-        
-        logger.info(f"[INLINE PARSER] Successfully parsed: {question_count}, Skipped: {skipped_count}")
-        return quizzes
-
-    @staticmethod
-    def _parse_parentheses_options_format(content: str) -> List[Dict]:
-        """
-        Parse format with numbered questions and A), B), C), D), E) options.
-        The correct answer is typically the first option (A) or marked in some way.
-        
-        Format:
-        1. Question text here?
-        A) First option (this might be bold in original)
-        B) Second option
-        C) Third option
-        D) Fourth option
-        E) Fifth option
-        """
-        quizzes = []
-        lines = content.strip().split('\n')
-        
-        current_question = None
-        current_question_lines = []
-        current_options = []
-        correct_answer = None
-        in_question = False
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Check if this is a new question (starts with number followed by period)
-            question_match = re.match(r'^(\d+)\.\s*(.+)', line)
-            if question_match:
-                # Save previous question if exists
-                if current_question and current_options and correct_answer is not None:
-                    quizzes.append({
-                        'question': current_question,
-                        'options': current_options,
-                        'correct_answer': correct_answer
-                    })
-                
-                # Start new question
-                question_text = question_match.group(2).strip()
-                current_question_lines = [question_text] if question_text else []
-                current_options = []
-                correct_answer = None
-                in_question = True
-                current_question = None
-                continue
-            
-            # Check if this is an option line (A), B), C), D), E))
-            option_match = re.match(r'^([A-E])\)\s*(.+)', line)
-            if option_match:
-                # Finalize question text before processing options
-                if in_question and current_question_lines:
-                    current_question = ' '.join(current_question_lines).strip()
-                    in_question = False
-                
-                option_letter = option_match.group(1)
-                option_text = option_match.group(2).strip()
-                
-                # Check for correct answer markers or indicators
-                is_correct = False
-                cleaned_text = option_text
-                
-                # Check for bold markers (if text contains these phrases, it's likely the correct answer)
-                if '(this is bold right answer)' in option_text.lower():
-                    is_correct = True
-                    cleaned_text = re.sub(r'\(this is bold right answer\)', '', option_text, flags=re.IGNORECASE).strip()
-                elif 'this is bold' in option_text.lower():
-                    is_correct = True
-                    cleaned_text = re.sub(r'\(.*?this is bold.*?\)', '', option_text, flags=re.IGNORECASE).strip()
-                # Common markers for correct answers
-                elif option_text.startswith('#'):
-                    is_correct = True
-                    cleaned_text = option_text[1:].strip()
-                elif option_text.startswith('# '):
-                    is_correct = True
-                    cleaned_text = option_text[2:].strip()
-                elif option_text.startswith('+'):
-                    is_correct = True
-                    cleaned_text = option_text[1:].strip()
-                elif option_text.startswith('✓') or option_text.startswith('✅'):
-                    is_correct = True
-                    cleaned_text = option_text[1:].strip()
-                # Check if marker is at the end
-                elif option_text.endswith('#') or option_text.endswith('+'):
-                    is_correct = True
-                    cleaned_text = option_text[:-1].strip()
-                
-                current_options.append(cleaned_text)
-                
-                if is_correct and correct_answer is None:
-                    correct_answer = len(current_options) - 1
-                
-                continue
-            
-            # If we're still collecting question text (multi-line question)
-            if in_question and not option_match:
-                # Skip common separators
-                if not re.match(r'^[\+\-=\|]+$', line):
-                    current_question_lines.append(line)
-        
-        # Don't forget the last question
-        if current_question and current_options and correct_answer is not None:
-            quizzes.append({
-                'question': current_question,
-                'options': current_options,
-                'correct_answer': correct_answer
-            })
-        
-        # If no correct answer was marked, assume first option (A) is correct
-        # This is a fallback for cases where bold formatting wasn't detected
-        for quiz in quizzes:
-            if quiz.get('correct_answer') is None and len(quiz['options']) >= 2:
-                quiz['correct_answer'] = 0
-        
-        return quizzes
-
-
-    @staticmethod
-    def _clean_content(content: str) -> str:
-        """Clean content from table artifacts and excessive whitespace."""
-        # Remove table borders like +---+ and |---| but PRESERVE ==== and ++++
-        content = re.sub(r'\+[-=]+\+', '', content)  # Remove +---+ but not ++++
-        content = re.sub(r'\|[-=|]+\|', '', content)
-        
-        # Remove standalone borders but PRESERVE Uzbek separators
-        lines = content.split('\n')
-        cleaned_lines = []
-        for line in lines:
-            stripped = line.strip()
-            
-            # Skip empty lines
-            if not stripped:
-                continue
-            
-            # PRESERVE Uzbek format separators
-            if stripped == '====' or stripped == '++++':
-                cleaned_lines.append(line)
-                continue
-            
-            # Skip lines that are ONLY table borders (-, |, +, but not ==== or ++++)
-            # This regex now excludes pure ==== and ++++
-            if re.match(r'^[\+\-\|]+$', stripped) and '=' not in stripped:
-                continue
-            
-            cleaned_lines.append(line)
-        
-        return '\n'.join(cleaned_lines)
-
-    @staticmethod
-    def _parse_uzbek_plus_marker_format(content: str) -> List[Dict]:
-        """
-        Uzbek format:
-        1. Question
-        option
-        option ++++
-        option
-        option
-        """
-        quizzes = []
-
-        blocks = re.split(r'\n(?=\d+\.)', content)
-
-        for block in blocks:
-            lines = [l.strip() for l in block.split('\n') if l.strip()]
-            if len(lines) < 3:
-                continue
-
-            # Question
-            question_line = lines[0]
-            question = re.sub(r'^\d+\.\s*', '', question_line).strip()
-
-            options = []
-            correct_index = None
-
-            for line in lines[1:]:
-                is_correct = '++++' in line
-                option_text = line.replace('++++', '').strip()
-
-                if not option_text:
-                    continue
-
-                options.append(option_text)
-
-                if is_correct:
-                    correct_index = len(options) - 1
-
-            if question and len(options) >= 2 and correct_index is not None:
-                quizzes.append({
-                    'question': question,
-                    'options': options,
-                    'correct_answer': correct_index
-                })
-            else:
-                logger.warning(
-                    f"[UZ_PLUS PARSER] ❌ Invalid quiz: "
-                    f"question={bool(question)}, options={len(options)}, correct={correct_index}"
-                )
-
-        logger.info(f"[UZ_PLUS PARSER] Parsed {len(quizzes)} quizzes")
-        return quizzes
-
-
-    @staticmethod
-    def _parse_separator_format(content: str, correct_marker: str = '#') -> List[Dict]:
-        """
-        Parse format with ==== separators.
-        Format: 
-        ====================================================================
-        1. Question text А) # correct Б) wrong В) wrong Г) wrong
-        ====================================================================
-        """
-        quizzes = []
-        
-        # First, split by the long separator lines (====...)
-        separator_pattern = r'={20,}'  # 20 or more equal signs
-        blocks = re.split(separator_pattern, content)
-        
-        for block in blocks:
-            block = block.strip()
-            if not block or len(block) < 10:
-                continue
-            
-            # Extract question number and text
-            question_match = re.match(r'^(\d+)\.\s*(.+)', block, re.DOTALL)
-            if not question_match:
-                continue
-            
-            question_num = question_match.group(1)
-            rest = question_match.group(2).strip()
-            
-            # Now parse the question and options
-            # Pattern: "Question text А) option Б) option В) option Г) option"
-            # Split by Cyrillic letters followed by )
-            option_pattern = r'([А-ЯA-Z])\)\s*'
-            
-            # Find where options start
-            option_start = re.search(option_pattern, rest)
-            if not option_start:
-                continue
-            
-            # Question is everything before first option
-            question_text = rest[:option_start.start()].strip()
-            options_text = rest[option_start.start():]
-            
-            # Split options
-            option_parts = re.split(option_pattern, options_text)
-            
-            options = []
-            correct_answer = None
-            
-            # Process in pairs: [letter, text, letter, text, ...]
-            for i in range(1, len(option_parts), 2):
-                if i + 1 >= len(option_parts):
-                    break
-                
-                option_letter = option_parts[i]
-                option_text = option_parts[i + 1].strip()
-                
-                # Check for correct marker
-                is_correct = False
-                if option_text.startswith(correct_marker):
-                    is_correct = True
-                    option_text = option_text[len(correct_marker):].strip()
-                elif option_text.startswith('# '):
-                    is_correct = True
-                    option_text = option_text[2:].strip()
-                
-                if option_text:
-                    options.append(option_text)
-                    if is_correct and correct_answer is None:
-                        correct_answer = len(options) - 1
-            
-            # Validate and add
-            if question_text and len(options) >= 2:
-                if correct_answer is None:
-                    correct_answer = 0  # Fallback to first option
-                
-                quizzes.append({
-                    'question': question_text,
-                    'options': options,
-                    'correct_answer': correct_answer
-                })
-                logger.info(f"[SEPARATOR PARSER] ✅ Parsed quiz {question_num}: {len(options)} options, correct={correct_answer}")
-            else:
-                logger.warning(f"[SEPARATOR PARSER] ❌ Invalid quiz {question_num}: question={bool(question_text)}, options={len(options)}")
-        
-        return quizzes
-
-    @staticmethod
-    def _parse_moodle_percentage_format(content: str) -> List[Dict]:
-        """
-        Parse Moodle-style format with percentage markers:
-        1. Question text?
-        {~%0% Wrong option
-        ~%100% Correct option
-        ~%0% Wrong option}
-        
-        Handles both single and multiple correct answers.
-        For multiple correct answers, stores them as a list in 'correct_answers'.
-        For single correct answer, stores as 'correct_answer' (int).
-        """
-        quizzes = []
-        
-        # Split into question blocks
-        pattern = r'(\d+)\.\s*(.+?)\s*\{(.+?)\}'
-        matches = re.finditer(pattern, content, re.DOTALL)
-        
-        match_count = 0
-        for match in matches:
-            match_count += 1
-            question_num = match.group(1)
-            question_text = match.group(2).strip()
-            options_block = match.group(3).strip()            
-            # Clean question text - remove extra whitespace and newlines
-            question_text = ' '.join(question_text.split())
-            
-            # Skip if question is too short
-            if len(question_text) < 5:
-                continue
-            
-            # Parse options from the block
-            option_lines = options_block.split('\n')
-            
-            current_options = []
-            correct_indices = []  
-            
-            for line in option_lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                # Match percentage pattern in the line
-                percentage_match = re.search(r'~?%(\d+(?:\.\d+)?)%\s*(.+)', line)
-                if not percentage_match:
-                    continue
-                
-                percentage = float(percentage_match.group(1))
-                option_text = percentage_match.group(2).strip()
-                
-                # Clean up option text - remove trailing } and extra whitespace
-                option_text = option_text.rstrip('}').strip()
-                option_text = ' '.join(option_text.split())
-                
-                # Skip empty options
-                if not option_text or len(option_text) < 1:
-                    continue
-                
-                current_options.append(option_text)
-                
-                # Track all options with non-zero percentage as correct
-                if percentage > 0:
-                    correct_indices.append(len(current_options) - 1)
-            
-            # Build the quiz data with the collected information
-            if question_text and len(current_options) >= 2 and len(correct_indices) > 0:                
-                # Build quiz dict based on number of correct answers
-                if len(correct_indices) == 1:
-                    # Single correct answer
-                    quiz_dict = {
-                        'question': question_text,
-                        'options': current_options,
-                        'correct_answer': correct_indices[0],
-                        'allows_multiple_answers': False
-                    }
-                else:
-                    # Multiple correct answers
-                    quiz_dict = {
-                        'question': question_text,
-                        'options': current_options,
-                        'correct_answers': correct_indices,
-                        'allows_multiple_answers': True
-                    }
-                
-                quizzes.append(quiz_dict)
-            else:
-                logger.warning(f"[MOODLE PARSER] ❌ Invalid quiz {match_count}: question={bool(question_text)}, options={len(current_options)}, correct={len(correct_indices)}")
-        
-        logger.info(f"[MOODLE PARSER] Total matches found: {match_count}, Valid quizzes: {len(quizzes)}")
-        return quizzes
-
-
-    @staticmethod
-    def _parse_question_mark_format(content: str) -> List[Dict]:
-        """
-        Parse format with ? as question separator and +/- for options.
-        """
-        quizzes = []
-        
-        # Split by lines starting with ?
-        lines = content.split('\n')
-        
-        current_question = None
-        current_options = []
-        correct_answer = None
-        
-        for line in lines:
-            line = line.strip()
-            
-            # Skip empty lines
-            if not line:
-                continue
-            
-            # Check if this is a new question (starts with ?)
-            if line.startswith('?'):
-                # Save previous question if it exists and is valid
-                if current_question and len(current_options) >= 2 and correct_answer is not None:
-                    quizzes.append({
-                        'question': current_question,
-                        'options': current_options,
-                        'correct_answer': correct_answer
-                    })
-                
-                # Start new question - remove the ? and any leading whitespace
-                question_text = line[1:].strip()
-                
-                # Skip if question is too short
-                if len(question_text) < 5:
-                    current_question = None
-                    current_options = []
-                    correct_answer = None
-                    continue
-                
-                current_question = question_text
-                current_options = []
-                correct_answer = None
-                continue
-            
-            # Process option lines (start with + or -, followed by tab or space)
-            if line.startswith('+') or line.startswith('-'):
-                # Extract option text (remove the +/- marker and leading whitespace)
-                option_text = line[1:].strip()
-                
-                # Skip empty options
-                if not option_text or len(option_text) < 2:
-                    continue
-                
-                # Add option
-                current_options.append(option_text)
-                
-                # Mark as correct if it starts with +
-                if line.startswith('+') and correct_answer is None:
-                    correct_answer = len(current_options) - 1
-        
-        # Don't forget the last question
-        if current_question and len(current_options) >= 2 and correct_answer is not None:
-            quizzes.append({
-                'question': current_question,
-                'options': current_options,
-                'correct_answer': correct_answer
-            })
-        
-        logger.info(f"[QUESTION_MARK PARSER] Parsed {len(quizzes)} quizzes")
-        return quizzes
-
-    @staticmethod
-    def _parse_numbered_format(content: str) -> List[Dict]:
-        """Parse format with numbered questions and lettered options."""
-        quizzes = []
-        lines = content.strip().split('\n')
-        
-        current_question = None
-        current_options = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            question_match = re.match(r'^(\d+)\.\s+(.+?)(?:\s+[a-d]\))', line)
-            if question_match:
-                if current_question and current_options:
-                    quizzes.append({
-                        'question': current_question,
-                        'options': current_options,
-                        'correct_answer': 0
-                    })
-                
-                current_question = question_match.group(2).strip()
-                current_options = []
-                
-                option_matches = re.finditer(r'([a-d])\)\s*([^a-d)]+)(?=[a-d]\)|$)', line)
-                
-                for match in option_matches:
-                    option_text = match.group(2).strip()
-                    current_options.append(option_text)
-        
-        if current_question and current_options:
-            quizzes.append({
-                'question': current_question,
-                'options': current_options,
-                'correct_answer': 0
-            })
-        
-        return quizzes
-    
-    @staticmethod
-    def _parse_standard_format(content: str, correct_marker: str = '#') -> List[Dict]:
-        """Parse standard format with A), B), C) options."""
-        quizzes = []
-        lines = content.strip().split('\n')
-        
-        current_question = None
-        current_question_lines = []  # Changed: collect multiple lines
-        current_options = []
-        correct_answer = None
-        in_question = False  # Track if we're collecting question lines
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Skip separator lines completely (====, ----, etc.)
-            if re.match(r'^[=\-+|]{3,}$', line):
-                continue
-            
-            # Check for option line - support both Latin (A-Z, a-z) and Cyrillic (а-я, А-Я)
-            option_match = re.match(r'^([A-Za-zА-Яа-я0-9])[.)]\s*(.+)', line)
-            
-            if option_match:
-                # Finalize question text before processing first option
-                if in_question and current_question_lines:
-                    current_question = ' '.join(current_question_lines).strip()
-                    in_question = False
-                
-                option_letter = option_match.group(1)
-                option_text = option_match.group(2).strip()
-                
-                # Remove any trailing separators from option text
-                option_text = re.sub(r'\s*[=\-+|]{3,}\s*$', '', option_text).strip()
-                
-                # Skip if option text is too short after cleaning
-                if len(option_text) < 2:
-                    continue
-                
-                is_correct = False
-                cleaned_text = option_text
-                
-                # Check if separator appears after this option (indicates correct answer)
-                if '===' in line or '---' in line:
-                    is_correct = True
-                    cleaned_text = re.sub(r'\s*[=\-+|]{3,}.*$', '', option_text).strip()
-                
-                if option_text.startswith(correct_marker):
-                    is_correct = True
-                    cleaned_text = option_text[len(correct_marker):].strip()
-                elif option_text.startswith('# '):
-                    is_correct = True
-                    cleaned_text = option_text[2:].strip()
-                elif option_text.startswith('✅') or option_text.startswith('✓'):
-                    is_correct = True
-                    cleaned_text = option_text[1:].strip()
-                elif option_text.startswith('+'):
-                    is_correct = True
-                    cleaned_text = option_text[1:].strip()
-                
-                # Only add if we have meaningful text
-                if len(cleaned_text) >= 2:
-                    current_options.append(cleaned_text)
-                    
-                    if is_correct and correct_answer is None:
-                        correct_answer = len(current_options) - 1
-            else:
-                # Check if this is a numbered question line (start of new question)
-                question_number_match = re.match(r'^(\d+)[.)]\s*(.+)', line)
-                
-                if question_number_match:
-                    # Save previous question if it's complete and valid
-                    if current_question and len(current_options) >= 2 and len(current_options) <= 10 and correct_answer is not None:
-                        quizzes.append({
-                            'question': current_question,
-                            'options': current_options,
-                            'correct_answer': correct_answer
-                        })
-                    
-                    # Start new question
-                    question_text = question_number_match.group(2).strip()
-                    question_text = re.sub(r'\s*[=\-+|]{3,}.*$', '', question_text).strip()
-                    
-                    current_question_lines = [question_text] if question_text else []
-                    current_options = []
-                    correct_answer = None
-                    in_question = True
-                    current_question = None
-                elif in_question:
-                    # This is a continuation of the question (multi-line question)
-                    # Clean and add to question lines
-                    cleaned_line = re.sub(r'\s*[=\-+|]{3,}.*$', '', line).strip()
-                    if cleaned_line and len(cleaned_line) >= 2:
-                        # Don't add lines that look like headers
-                        if not any(keyword in cleaned_line.lower() for keyword in 
-                                ['fakultet', 'kafedra', 'test', 'variant', 'respublik', 'vazirligi', 'kelishildi']):
-                            current_question_lines.append(cleaned_line)
-        
-        # Don't forget the last question - with validation
-        if current_question and len(current_options) >= 2 and len(current_options) <= 10 and correct_answer is not None:
-            quizzes.append({
-                'question': current_question,
-                'options': current_options,
-                'correct_answer': correct_answer
-            })
-        
-        return quizzes
-
-    @staticmethod
-    def _parse_table_format(content: str) -> List[Dict]:
-        """Parse table format with | separators and numbered rows."""
-        quizzes = []
-        lines = content.strip().split('\n')
-        
-        current_question = None
-        current_options = []
-        correct_answer = None
-        question_started = False
-        
-        # Track column positions for Uzbek format
-        correct_col_idx = None
-        wrong_cols_idx = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line or '|' not in line:
-                continue
-            
-            # Skip header rows but capture column structure
-            if any(keyword in line.lower() for keyword in 
-                ['savol', 'javob', 'muqobil', "to'g'ri", 'tartib', 'raqam', 'faculty', 'fakultet']):
-                # Detect column positions from header
-                parts = [p.strip() for p in line.split('|')]
-                for idx, part in enumerate(parts):
-                    if "to'g'ri" in part.lower() or 'correct' in part.lower():
-                        correct_col_idx = idx
-                    elif 'muqobil' in part.lower() or 'alternative' in part.lower():
-                        wrong_cols_idx.append(idx)
-                continue
-            
-            # Skip separator lines
-            if re.match(r'^[\|\-\+=\s]+$', line):
-                continue
-            
-            # Split by | and clean up parts
-            parts = [p.strip() for p in line.split('|') if p.strip()]
-            
-            if len(parts) < 2:
-                continue
-            
-            marker = parts[0].strip()
-            
-            # Check if this is a question row (numbered 1, 2, 3, etc.)
-            if marker.isdigit() or re.match(r'^\d+\.$', marker):
-                # Save previous question if exists
-                if current_question and current_options and correct_answer is not None:
-                    quizzes.append({
-                        'question': current_question,
-                        'options': current_options,
-                        'correct_answer': correct_answer
-                    })
-                
-                # Extract question from parts[1]
-                current_question = parts[1].strip() if len(parts) > 1 else ""
-                current_options = []
-                correct_answer = None
-                question_started = True
-                
-                # Extract correct answer and options from columns
-                if len(parts) > 2:
-                    # parts[2] is "To'g'ri javob" column
-                    correct_text = parts[2].strip()
-                    if correct_text and len(correct_text) > 1:
-                        # Remove markers
-                        correct_text = correct_text.lstrip('#').lstrip('+').strip()
-                        current_options.append(correct_text)
-                        correct_answer = 0  # First option is correct
-                    
-                    # parts[3], parts[4], parts[5] are "Muqobil javob" columns
-                    for idx in range(3, len(parts)):
-                        option_text = parts[idx].strip()
-                        if option_text and len(option_text) > 1:
-                            # Skip if it's a separator
-                            if not re.match(r'^[\+\-=\|]+$', option_text):
-                                current_options.append(option_text)
-        
-        # Add the last question
-        if current_question and current_options and correct_answer is not None:
-            quizzes.append({
-                'question': current_question,
-                'options': current_options,
-                'correct_answer': correct_answer
-            })
-        
-        return quizzes
-
-    @staticmethod
-    def _parse_lettered_options_format(content: str) -> List[Dict]:
-        """
-        Parse format with numbered questions and A), B), C), D) options.
-        Handles multi-line questions and detects correct answers by markers.
-        
-        Format:
-        1. Question text here
-        may span multiple lines
-        A) First option
-        B) Second option
-        C) #Correct option (marked with # or other indicator)
-        D) Fourth option
-        
-        2. Next question...
-        """
-        quizzes = []
-        lines = content.strip().split('\n')
-        
-        current_question = None
-        current_question_lines = []
-        current_options = []
-        correct_answer = None
-        in_question = False
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Check if this is a new question (starts with number followed by period/dot)
-            question_match = re.match(r'^(\d+)\.\s*(.+)', line)
-            if question_match:
-                # Save previous question if exists
-                if current_question and current_options and correct_answer is not None:
-                    quizzes.append({
-                        'question': current_question,
-                        'options': current_options,
-                        'correct_answer': correct_answer
-                    })
-                
-                # Start new question
-                question_text = question_match.group(2).strip()
-                current_question_lines = [question_text] if question_text else []
-                current_options = []
-                correct_answer = None
-                in_question = True
-                current_question = None
-                continue
-            
-            # Check if this is an option line (A), B), C), D))
-            option_match = re.match(r'^([A-D])\)\s*(.+)', line)
-            if option_match:
-                # Finalize question text before processing options
-                if in_question and current_question_lines:
-                    current_question = ' '.join(current_question_lines).strip()
-                    in_question = False
-                
-                option_letter = option_match.group(1)
-                option_text = option_match.group(2).strip()
-                
-                # Check for correct answer markers
-                is_correct = False
-                cleaned_text = option_text
-                
-                # Common markers for correct answers
-                if option_text.startswith('#'):
-                    is_correct = True
-                    cleaned_text = option_text[1:].strip()
-                elif option_text.startswith('# '):
-                    is_correct = True
-                    cleaned_text = option_text[2:].strip()
-                elif option_text.startswith('+'):
-                    is_correct = True
-                    cleaned_text = option_text[1:].strip()
-                elif option_text.startswith('✓') or option_text.startswith('✅'):
-                    is_correct = True
-                    cleaned_text = option_text[1:].strip()
-                # Check if marker is at the end
-                elif option_text.endswith('#') or option_text.endswith('+'):
-                    is_correct = True
-                    cleaned_text = option_text[:-1].strip()
-                
-                current_options.append(cleaned_text)
-                
-                if is_correct and correct_answer is None:
-                    correct_answer = len(current_options) - 1
-                
-                continue
-            
-            # If we're still collecting question text (multi-line question)
-            if in_question and not option_match:
-                # Skip common separators
-                if not re.match(r'^[\+\-=\|]+$', line):
-                    current_question_lines.append(line)
-        
-        # Don't forget the last question
-        if current_question and current_options and correct_answer is not None:
-            quizzes.append({
-                'question': current_question,
-                'options': current_options,
-                'correct_answer': correct_answer
-            })
-        
-        # If no correct answer was marked, assume first option (A) is correct
-        # This is a fallback for cases where highlighting wasn't converted to markers
-        for quiz in quizzes:
-            if quiz['correct_answer'] is None and len(quiz['options']) >= 2:
-                quiz['correct_answer'] = 0
-        
-        return quizzes
-    
-    @staticmethod
-    def _parse_uzbek_format(content: str, correct_marker: str = '#') -> List[Dict]:
-        quizzes = []
-
-        # Normalize separators safely
-        content = re.sub(r'\n\s*\+{3,}\s*\n', '\n++++\n', content)
-        content = re.sub(r'\n\s*={3,}\s*\n', '\n====\n', content)
-
-        # Split into question blocks
-        question_blocks = content.split('++++')
-
-        for block in question_blocks:
-            block = block.strip()
-            if not block:
-                continue
-
-            parts = [p.strip() for p in block.split('====') if p.strip()]
-            if len(parts) < 3:
-                continue
-
-            question = parts[0]
-            options = []
-            correct_answer = None
-
-            for part in parts[1:]:
-                text = part.strip()
-
-                if not text:
-                    continue
-
-                if text.startswith(correct_marker):
-                    cleaned = text[len(correct_marker):].strip()
-                    options.append(cleaned)
-                    if correct_answer is None:
-                        correct_answer = len(options) - 1
-                else:
-                    options.append(text)
-
-            if len(options) >= 2:
-                if correct_answer is None:
-                    correct_answer = 0  # safe fallback
-
-                quizzes.append({
-                    'question': question,
-                    'options': options,
-                    'correct_answer': correct_answer
-                })
-
-        return quizzes
-
-    @staticmethod
-    def _parse_plus_minus_format(content: str) -> List[Dict]:
-        quizzes = []
-
-        lines = [l for l in content.splitlines() if True]
-
-        current_question = None
-        current_question_lines = []
-        current_options = []
-        correct_answer = None
-        in_options = False
-
-        def save_current():
-            if (
-                current_question
-                and len(current_options) >= 2
-                and correct_answer is not None
-            ):
-                quizzes.append({
-                    'question': current_question,
-                    'options': current_options,
-                    'correct_answer': correct_answer
-                })
-
-        for raw_line in lines:
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            # QUESTION - "1#", "2#" style
-            number_hash_match = re.match(r'^(\d+)\s*#\s*(.+)', line)
-            if number_hash_match:
-                save_current()
-                current_question_lines = [number_hash_match.group(2).strip()]
-                current_question = current_question_lines[0]
-                current_options = []
-                correct_answer = None
-                in_options = False
-                continue
-
-            # CORRECT OPTION (+)
-            if line.startswith('+'):
-                if not in_options and current_question_lines:
-                    current_question = '\n'.join(current_question_lines).strip()
-                in_options = True
-                option = line[1:].strip().rstrip('.;')
-                option = re.sub(r'^[A-Fa-f]\)\s*', '', option)
-                if option:
-                    current_options.append(option)
-                    if correct_answer is None:
-                        correct_answer = len(current_options) - 1
-                continue
-
-            # WRONG OPTION (-)
-            if line.startswith('-'):
-                if not in_options and current_question_lines:
-                    current_question = '\n'.join(current_question_lines).strip()
-                in_options = True
-                option = line[1:].strip().rstrip('.;')
-                option = re.sub(r'^[A-Fa-f]\)\s*', '', option)
-                if option:
-                    current_options.append(option)
-                continue
-
-            # WRONG OPTION (=)
-            if line.startswith('='):
-                if not in_options and current_question_lines:
-                    current_question = '\n'.join(current_question_lines).strip()
-                in_options = True
-                option = line[1:].strip().rstrip('.;')
-                option = re.sub(r'^[A-Fa-f]\)\s*', '', option)
-                if option:
-                    current_options.append(option)
-                continue
-
-            is_top_level_question = (
-                line.startswith('?') or
-                line.startswith('*') or
-                re.match(r'^\d+[\.\)]\s+\S', line)
-            )
-
-            if is_top_level_question and not (current_question_lines and not in_options and re.match(r'^\d+[\.\)]\s+', line) and current_question_lines):
-                if current_question_lines and not in_options:
-                    current_question_lines.append(line)
-                    continue
-                else:
-                    save_current()
-                    cleaned = line.lstrip('*').lstrip('?').strip()
-                    cleaned = re.sub(r'^\d+[\.\)]\s*', '', cleaned).strip()
-                    current_question_lines = [cleaned]
-                    current_question = cleaned
-                    current_options = []
-                    correct_answer = None
-                    in_options = False
-                    continue
-
-            # ── KEY FIX ──────────────────────────────────────────────────────────
-            # Lines like "a) text b) text c) text d) text" are Mazmunlar content
-            # that belongs to the question body. They must NOT be consumed as answer
-            # options while we are still collecting the question (in_options=False).
-            # Only skip to the body-append path; never treat them as quiz options.
-            if not in_options and re.match(r'^[a-dA-D]\)\s*\S', line):
-                # This is a lettered sub-content line (Mazmunlar), not a quiz option.
-                # Append it to the question body.
-                if current_question_lines:
-                    current_question_lines.append(line)
-                continue
-            # ─────────────────────────────────────────────────────────────────────
-
-            # Plain line — if collecting question body, append; else skip
-            if current_question_lines and not in_options:
-                if not any(kw in line.lower() for kw in
-                        ['fakultet', 'kafedra', 'test', 'variant', 'respublik', 'vazirligi', 'kelishildi']):
-                    current_question_lines.append(line)
-                continue
-
-        save_current()
-        return quizzes
-
-        
-    @staticmethod
-    def _parse_excel_format(content: str) -> List[Dict]:
-        """Parse Excel format with tab-separated values."""
-        quizzes = []
-        lines = content.strip().split('\n')
-        
-        start_idx = 0
-        if lines and any(keyword in lines[0].lower() for keyword in 
-                        ['question', 'savol', 'вопрос', 't/r', 'tibbiy']):
-            start_idx = 1
-        
-        for line_idx in range(start_idx, len(lines)):
-            line = lines[line_idx].strip()
-            if not line:
-                continue
-            
-            parts = [p.strip() for p in line.split('\t') if p.strip()]
-            
-            if len(parts) < 3:
-                continue
-            
-            question = parts[0]
-            options = []
-            correct_answer = None
-            
-            for idx, part in enumerate(parts[1:]):
-                if part.startswith('#'):
-                    correct_answer = len(options)
-                    options.append(part[1:].strip())
-                elif part.startswith('+'):
-                    correct_answer = len(options)
-                    options.append(part[1:].strip())
-                elif part.startswith('✅'):
-                    correct_answer = len(options)
-                    options.append(part[1:].strip())
-                else:
-                    options.append(part)
-            
-            if correct_answer is None and len(options) >= 2:
-                for idx, opt in enumerate(options):
-                    if '#' in opt:
-                        correct_answer = idx
-                        options[idx] = opt.replace('#', '').strip()
-                        break
-                
-                if correct_answer is None:
-                    correct_answer = 0
-            
-            if len(options) >= 2 and correct_answer is not None:
-                quizzes.append({
-                    'question': question,
-                    'options': options,
-                    'correct_answer': correct_answer
-                })
-        
-        return quizzes
 
     @staticmethod
     def get_split_options() -> List[int]:
-        """Get available batch size options."""
-        return [10, 20, 30, 40, 50, 100]
-    
-    @staticmethod
-    def split_quizzes(quizzes: List[Dict], batch_size: int) -> List[List[Dict]]:
-        """Split quizzes into batches of specified size."""
-        if batch_size <= 0:
-            raise ValueError("Batch size must be positive")
-        
-        batches = []
-        for i in range(0, len(quizzes), batch_size):
-            batches.append(quizzes[i:i + batch_size])
-        
-        return batches
-
+        return [10, 20, 25, 30, 40, 50, 100]
 
     @staticmethod
-    def calculate_batches(total_quizzes: int, batch_size: int) -> Tuple[int, int]:
-        """Calculate number of batches and remaining quizzes."""
-        if batch_size <= 0:
-            raise ValueError("Batch size must be positive")
-        
-        full_batches = total_quizzes // batch_size
-        remainder = total_quizzes % batch_size
-        
-        total_batches = full_batches + (1 if remainder > 0 else 0)
-        last_batch_size = remainder if remainder > 0 else batch_size
-        
-        return total_batches, last_batch_size
+    def calculate_batches(total: int, size: int) -> Tuple[int, int]:
+        if total <= 0:
+            return 0, 0
+        if size <= 0 or size > total:
+            size = total
+        num = math.ceil(total / size)
+        last = total - (num - 1) * size
+        return num, last
+
+    @staticmethod
+    def split_quizzes(quizzes: List[Dict], size: int) -> List[List[Dict]]:
+        """Consecutive chunks - the original order is kept (important for learning)."""
+        if not quizzes:
+            return []
+        if size <= 0 or size > len(quizzes):
+            size = len(quizzes)
+        return [quizzes[i:i + size] for i in range(0, len(quizzes), size)]
+
+    # ------------------------------ parsing core ---------------------------- #
+    @classmethod
+    def _parse(cls, content: str, marker: str) -> List[Dict]:
+        text = content.replace("\r\n", "\n").replace("\r", "\n")
+        quizzes: List[Dict] = []
+        cur: Optional[_Block] = None
+
+        def flush():
+            nonlocal cur
+            if cur is not None:
+                q = cls._build(cur, len(quizzes) + 1)
+                if q:
+                    quizzes.append(q)
+            cur = None
+
+        def start(num: Optional[int] = None) -> _Block:
+            nonlocal cur
+            flush()
+            cur = _Block(num)
+            return cur
+
+        for raw in text.split("\n"):
+            ln = cls._clean(raw)
+            if not ln:
+                continue
+
+            # 1) answer line ------------------------------------------------
+            m = _RE_ANS.match(ln)
+            if m:
+                if cur is not None and cur.options:
+                    cur.ans_letter = _norm_letter(m.group(1)).upper()
+                    cur.closed = True
+                continue
+
+            # 1b) marker in FRONT of an option:  "► C) ...", "✅ B) ..."  --------
+            lead_marked = False
+            lm = _RE_LEAD_MARK.match(ln)
+            if lm and lm.end() > 0 and _RE_MARKS.search(lm.group(0)):
+                rest = ln[lm.end():]
+                if _RE_OPT.match(rest):
+                    ln, lead_marked = rest, True
+
+            # 2) block headers ("31-SAVOL", "12. Murakkab ... testi") ---------
+            m = _RE_NSAVOL.match(ln)
+            if m:
+                start(int(m.group(1)))
+                continue
+            m = _RE_TYPE_HDR.match(ln)
+            if m:
+                start(int(m.group(1)))
+                continue
+
+            # 3) option  A) B) C) D) ------------------------------------------
+            m = _RE_OPT.match(ln)
+            if m:
+                letter = _norm_letter(m.group(1))
+                sep = m.group(2)
+                n_opts = len(cur.options) if cur is not None else 0
+                expected = chr(65 + n_opts)
+                accept = False
+                if letter == expected and (sep != "." or n_opts > 0):
+                    accept = True
+                    if cur is None:
+                        cur = _Block()
+                elif letter == "A" and n_opts > 0 and sep != ".":
+                    start()                       # options of a new, stem-less question
+                    accept = True
+                if accept:
+                    body, has_mark = _strip_marks(m.group(3))
+                    has_mark = has_mark or lead_marked
+                    if marker and body.startswith(marker):
+                        body, has_mark = body[len(marker):].strip(), True
+                    cur.options.append(body)
+                    if has_mark:
+                        cur.correct = len(cur.options) - 1
+                    continue
+                # else: not a real option -> falls through as plain text
+
+            # 4) "Savol: ..." ---------------------------------------------------
+            m = _RE_SAVOL.match(ln)
+            if m:
+                body = m.group(1).strip()
+                if (cur is None or cur.options or cur.items
+                        or any(k == "savol" for k, _ in cur.parts)):
+                    start()
+                glued = _RE_GLUED_LABEL.search(body)
+                if glued:
+                    label = glued.group(1)
+                    body = body[:glued.start()].rstrip()
+                    if body:
+                        cur.parts.append(("savol", body))
+                    cur.parts.append(("label", label))
+                else:
+                    cur.parts.append(("savol", body))
+                continue
+
+            # 5) lowercase matching item  a) b) c) d) --------------------------
+            m = _RE_ITEM.match(ln)
+            if m and cur is not None and not cur.options:
+                letter = _norm_letter(m.group(1))
+                sep = m.group(2)
+                if letter == chr(97 + len(cur.items)) and (sep != "." or cur.items):
+                    cur.items.append(_strip_marks(m.group(3))[0])
+                    continue
+
+            # 6) numbered line "7. ..."  (new question OR typed concept list) --
+            m = _RE_NUMQ.match(ln)
+            if m:
+                num, body = int(m.group(1)), _strip_marks(m.group(2))[0]
+                if cur is None or cur.options or cur.items or not cls._is_listed(cur, num):
+                    blk = start(num)
+                    blk.parts.append(("text", body))
+                else:
+                    cur.parts.append(("list", body))
+                    cur.last_listed = num
+                continue
+
+            # 7) label line ("Mazmunlar:", "Tushunchalar:") ---------------------
+            if _RE_LABEL.match(ln):
+                if cur is None:
+                    start()
+                if not cur.options and not cur.items:
+                    cur.parts.append(("label", ln[:-1].strip()))
+                continue
+
+            # 8) plain text ------------------------------------------------------
+            if cur is None:
+                start().parts.append(("text", _strip_marks(ln)[0]))
+                continue
+            if cur.options:
+                if cur.closed or (cur.correct is not None and len(cur.options) >= 4):
+                    start().parts.append(("text", _strip_marks(ln)[0]))   # next question, no header
+                else:                                                    # wrapped option text
+                    body, has_mark = _strip_marks(ln)
+                    cur.options[-1] = (cur.options[-1] + " " + body).strip()
+                    if has_mark:
+                        cur.correct = len(cur.options) - 1
+                continue
+            if cur.items:                                                # wrapped item text
+                cur.items[-1] = (cur.items[-1] + " " + _strip_marks(ln)[0]).strip()
+                continue
+            cur.parts.append(("text", _strip_marks(ln)[0]))
+
+        flush()
+        cls.last_stats["questions"] = len(quizzes)
+        return quizzes
+
+    # ------------------------------ helpers --------------------------------- #
+    @staticmethod
+    def _clean(raw: str) -> Optional[str]:
+        """Return a cleaned line, or None for empty / noise lines."""
+        ln = raw.replace("\u00a0", " ").replace("\u200b", "").replace("\t", " ").strip()
+        if not ln:
+            return None
+        if ln.startswith(">"):                                  # pasted Telegram quote: "> IHulkar:"
+            ln = ln.lstrip("> ").strip()
+            if not ln:
+                return None
+            if re.fullmatch(r"[\w .@]{1,32}:", ln) and ln[:-1].strip().lower() not in _KNOWN_LABELS:
+                return None
+        if _RE_PATH.search(ln):
+            return None
+        if (_RE_NTEST.match(ln) or _RE_PAIRS_NOISE.match(ln) or _RE_SEQ_OPT.match(ln)
+                or _RE_FILLER.match(ln) or _RE_VARIANTS.match(ln)):
+            return None
+        return re.sub(r"[ ]{2,}", " ", ln)
+
+    @staticmethod
+    def _is_listed(cur: _Block, num: int) -> bool:
+        """Is this numbered line a typed concept (1. 2. 3.) of the current stem?"""
+        if not cur.parts:
+            return False
+        kind, text = cur.parts[-1]
+        if kind == "label":
+            return True
+        if kind == "list" and cur.last_listed is not None and num == cur.last_listed + 1:
+            return True
+        if kind in ("text", "savol") and (text.endswith(":") or _RE_LIST_INTRO.search(text)):
+            return True
+        return False
+
+    # ------------------------------ building -------------------------------- #
+    @classmethod
+    def _build(cls, blk: _Block, idx: int) -> Optional[Dict]:
+        opts = [o.strip() for o in blk.options]
+        has_savol = any(k == "savol" for k, _ in blk.parts)
+
+        if len(opts) < 2:
+            if has_savol or blk.num is not None or blk.items:
+                cls.last_warnings.append(f"#{idx}: skipped, fewer than 2 options")
+            return None
+
+        # ---- correct answer ----
+        correct = blk.correct
+        if blk.ans_letter:
+            from_line = ord(blk.ans_letter) - 65
+            if correct is not None and correct != from_line:
+                cls.last_warnings.append(
+                    f"#{idx}: marker on option {chr(65 + correct)} but answer line says {blk.ans_letter} (answer line used)")
+            correct = from_line
+        if correct is None or not (0 <= correct < len(opts)):
+            cls.last_warnings.append(f"#{idx}: correct answer not found")
+            cls.last_stats["no_answer"] += 1
+            correct = None
+
+        # Telegram needs unique poll options.  Some files repeat the correct option under
+        # two letters ("C) 1-c, 2-a, 3-b" and "► D) 1-c, 2-a, 3-b") -> merge identical options
+        # and keep the marked one, so the answer stays unambiguous.
+        keep: List[int] = []
+        pos: Dict[str, int] = {}
+        for i, o in enumerate(opts):
+            key = re.sub(r"\s+", " ", o).casefold()
+            if key in pos:
+                if i == correct:
+                    keep[pos[key]] = i
+                continue
+            pos[key] = len(keep)
+            keep.append(i)
+        if len(keep) != len(opts):
+            cls.last_warnings.append(f"#{idx}: {len(opts) - len(keep)} duplicate option(s) merged")
+            cls.last_stats["duplicate_options"] = cls.last_stats.get("duplicate_options", 0) + 1
+            correct = keep.index(correct) if correct in keep else None
+            opts = [opts[i] for i in keep]
+            if len(opts) < 2:
+                return None
+
+        question = cls._compose_question(blk, opts)
+        if not question:
+            cls.last_warnings.append(f"#{idx}: empty question text")
+            return None
+
+        if len(question) > MAX_POLL_QUESTION:
+            cls.last_stats["long_questions"] += 1
+        for o in opts:
+            if len(o) > MAX_POLL_OPTION:
+                cls.last_stats["long_options"] += 1
+                cls.last_warnings.append(f"#{idx}: option longer than {MAX_POLL_OPTION} chars ({len(o)})")
+                break
+
+        return {
+            "question": question,
+            "options": opts,
+            "correct_answer": correct,
+            "allows_multiple_answers": False,
+        }
+
+    @classmethod
+    def _compose_question(cls, blk: _Block, opts: List[str]) -> str:
+        is_match = all(_RE_MATCH_OPT.match(o) for o in opts)
+        is_seq = (not is_match) and all(_RE_SEQ_OPT.match(o) for o in opts)
+
+        if is_match:
+            k = len(re.findall(r"\d\s*[-–—]\s*[a-fA-F]", opts[0]))
+        elif is_seq:
+            k = len(re.findall(r"\d", opts[0]))
+        else:
+            k = len(blk.items)
+
+        if not (is_match or is_seq or blk.items):
+            return cls._compose_plain(blk)
+
+        # ---------- list-type question: sentence + numbered concepts (+ a) b) c) d) items) ----------
+        parts = blk.parts
+        mz_label = None
+        label_entries = [(i, t) for i, (kd, t) in enumerate(parts) if kd == "label"]
+        if blk.items and parts and parts[-1][0] == "label":
+            mz_label = parts[-1][1]
+            label_entries = label_entries[:-1]
+        concept_label = label_entries[0][1] if label_entries else None
+
+        content = [(kd, t) for kd, t in parts if kd != "label"]
+        cand = [i for i, (kd, _) in enumerate(content) if kd in ("text", "list")]
+        concept_idx = cand[-k:] if (k and len(cand) >= k) else cand
+        concepts = [content[i][1] for i in concept_idx]
+        sentence = " ".join(t for i, (kd, t) in enumerate(content) if i not in concept_idx).strip()
+
+        sections: List[str] = []
+        if sentence:
+            sections.append(sentence)
+
+        if concepts:
+            lines = []
+            label = concept_label or ("Tushunchalar" if is_match or blk.items else None)
+            if label:
+                label = re.sub(r"(?i)^tuhunchalar$", "Tushunchalar", label)
+                lines.append(f"{label}:")
+            lines += [f"{n}. {c}" for n, c in enumerate(concepts, 1)]
+            sections.append("\n".join(lines))
+
+        if blk.items:
+            lines = [f"{mz_label or 'Mazmunlar'}:"]
+            lines += [f"{chr(97 + n)}) {t}" for n, t in enumerate(blk.items)]
+            sections.append("\n".join(lines))
+
+        return "\n\n".join(sections).strip()
+
+    @staticmethod
+    def _compose_plain(blk: _Block) -> str:
+        before: List[str] = []
+        savol: Optional[str] = None
+        after: List[str] = []
+        for kd, t in blk.parts:
+            if kd == "label":
+                continue
+            if kd == "savol" and savol is None:
+                savol = t
+            elif savol is None:
+                before.append(t)
+            else:
+                after.append(t)
+        scenario = " ".join(before).strip()
+        if savol is None:
+            return scenario
+        question = " ".join([savol] + after).strip()
+        if scenario and question:
+            return f"{scenario}\n\n{question}"
+        return scenario or question
 
 
-
-
-
-def validate_quiz_structure(quizzes: List[Dict]) -> Tuple[bool, List[str]]:
-    """Validate quiz structure and return issues."""
-    issues = []
-    valid_quizzes = []
-    
-    if not quizzes:
-        issues.append("No quizzes found in file")
-        return False, issues
-    
-    for idx, quiz in enumerate(quizzes, 1):
-        is_valid = True
-        
-        if not quiz.get('question') or len(quiz.get('question', '').strip()) < 5:
-            issues.append(f"Quiz {idx}: Missing or too short question")
-            is_valid = False
-        
-        if not quiz.get('options') or len(quiz['options']) < 2:
-            issues.append(f"Quiz {idx}: Less than 2 options")
-            is_valid = False
-        
-        # Check for both single and multiple answer formats
-        has_single_answer = quiz.get('correct_answer') is not None
-        has_multiple_answers = quiz.get('correct_answers') is not None
-        
-        if not has_single_answer and not has_multiple_answers:
-            issues.append(f"Quiz {idx}: No correct answer marked")
-            is_valid = False
-        elif has_single_answer:
-            # Validate single answer
-            if quiz.get('correct_answer', -1) >= len(quiz.get('options', [])):
-                issues.append(f"Quiz {idx}: Correct answer index out of range")
-                is_valid = False
-        elif has_multiple_answers:
-            # Validate multiple answers
-            correct_answers = quiz.get('correct_answers', [])
-            if not correct_answers or not isinstance(correct_answers, list):
-                issues.append(f"Quiz {idx}: Invalid multiple correct answers format")
-                is_valid = False
-            elif any(idx >= len(quiz.get('options', [])) for idx in correct_answers):
-                issues.append(f"Quiz {idx}: One or more correct answer indices out of range")
-                is_valid = False
-        
-        if is_valid:
-            valid_quizzes.append(quiz)
-    
-    return len(valid_quizzes) > 0, issues
+# --------------------------------------------------------------------------- #
+#  Validation (imported by quiz_split_handlers)
+# --------------------------------------------------------------------------- #
+def validate_quiz_structure(quiz: Dict) -> bool:
+    """True when the quiz has a question, >= 2 options and a valid correct answer."""
+    try:
+        if not quiz or len((quiz.get("question") or "").strip()) < 3:
+            return False
+        opts = [o for o in (quiz.get("options") or []) if o and o.strip()]
+        if len(opts) < 2:
+            return False
+        if quiz.get("allows_multiple_answers"):
+            ca = quiz.get("correct_answers") or []
+            return bool(ca) and all(isinstance(i, int) and 0 <= i < len(opts) for i in ca)
+        ca = quiz.get("correct_answer")
+        return isinstance(ca, int) and 0 <= ca < len(opts)
+    except Exception:
+        return False

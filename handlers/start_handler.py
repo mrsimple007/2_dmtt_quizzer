@@ -97,7 +97,7 @@ MAIN_MENU_TRANSLATIONS = {
         "processing":"⏳ Обрабатываю ваш запрос. Пожалуйста, подождите..."
     },
     "uz": {
-        "welcome_message": "🔥 *Xush kelibsiz {name}!*\n\nMen sizga tez va oson quizlar yaratishda yordam beraman. \n\nSun'iy intellekt bilan istalgan mavzuda quiz tuzish uchun - 🎯 Quiz yaratish\n\n Yakuniy yoki Hemis testlaringizni bo'lish uchun - 📂 Hemis quizni bo'lish tugmasini bosing.\n\n💡Bizning yangi botimiz siz uchun sekundlarda maxsus presentatsiyalar yaratib beradi: @SimplePresentation\\_maker\\_bot",
+        "welcome_message": "🔥 *Xush kelibsiz {name}!*\n\nMen sizga tez va oson quizlar yaratishda yordam beraman. \n\nSun'iy intellekt bilan istalgan mavzuda quiz tuzish uchun - 🎯 Quiz yaratish\n\n Yakuniy yoki Hemis testlaringizni bo'lish uchun - 📂 Hemis quizni bo'lish tugmasini bosing.",
         "send_document": (
             "📤 <b>Testingizni yaratishga tayyorman!</b>\n\n"
             "Menga istalgan kontent yuboring — men uni testga aylantirib beraman!\n\n"
@@ -880,22 +880,13 @@ async def send_next_question(
         adjusted_quiz_time = quiz_time + 3 
 
 
-        # FIXED: Truncate question if too long (Telegram limit is 300 chars)
-        # FIXED: Send full question as separate message if too long, then send poll with number only
-        MAX_QUESTION_LENGTH = 280
-
-        if len(question_base) > MAX_QUESTION_LENGTH:
-            # Send full question text as a separate message first
-            full_question_text = f"<b>{question_number}/{total_questions}:</b> {question_base}"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=full_question_text,
-                parse_mode="HTML"
-            )
-            # Use only the question number in the poll
-            question_text = f"{question_number}/{total_questions}"
-        else:
-            question_text = f"{question_number}/{total_questions}: {question_base}"
+        # ALWAYS send the full question as its own message; the poll shows only "n/total"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=format_question_message(question_number, total_questions, question_base, options),
+            parse_mode="HTML",
+        )
+        question_text = f"{question_number}/{total_questions}"
 
         # Final safety check
         if len(question_text) > 300:

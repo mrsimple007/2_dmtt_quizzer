@@ -45,6 +45,12 @@ REQUIRED_CHANNELS = [
             'url': 'https://t.me/DMTT_attestat_HulkarIbragimova'
         },
 
+        {
+            'id': '@MTT_direktorlari',  
+            'name': 'MTT direktorlari',
+            'url': 'https://t.me/MTT_direktorlari'
+        },
+
 
     # {
     #     'id': '@Ai_zonez',
@@ -65,9 +71,6 @@ SUBSCRIPTION_MESSAGES = {
         "instruction": (
             "To use this bot, please subscribe to our partner channels below 👇\n\n"
             "📌 <i>This helps us keep the bot free and continuously improve it.</i>\n\n"
-            "💡 <b>Bonus:</b> Our new bot "
-            "@Simplepresentation_maker_bot can help you create "
-            "presentations, reports, course papers, independent works, resumes, and more — automatically!"
         ),
         "subscribe_btn": "📢 ",
         "check_btn": "✅ Check Subscription",
@@ -75,7 +78,6 @@ SUBSCRIPTION_MESSAGES = {
             "🎉 <b>Perfect!</b>\n\n"
             "You're all set and ready to go 🚀\n\n"
             "👉 Type /start to begin using the bot.\n\n"
-            "✨ Don’t forget to try @Simplepresentation_maker_bot for fast and smart document creation!\n\n"
             "💡 With /info you can learn more about us."
         ),
         "still_required": (
@@ -98,16 +100,12 @@ SUBSCRIPTION_MESSAGES = {
         "instruction": (
             "Botdan cheklovlarsiz foydalanish uchun quyidagi hamkor kanallarimizga obuna bo'ling 👇\n\n"
             "📌 <i>Bu bizga botni bepul va yanada sifatli qilishga yordam beradi.</i>\n\n"
-            "💡 <b>Bundan tashqari:</b> Yangi botimiz "
-            "@Simplepresentation_maker_bot orqali siz "
-            "prezentatsiya, referat, kurs ishi, mustaqil ish, rezyume va boshqa hujjatlarni tez va sifatli yaratishingiz mumkin!"
         ),
         "subscribe_btn": "📢 ",
         "check_btn": "✅ Obunani Tekshirish",
         "success": (
             "🎉 <b>Ajoyib!</b>\n\n"
             "Hammasi tayyor ✅ Endi botdan hech qanday cheklovlarsiz foydalanishingiz mumkin. 👉 Boshlash uchun /start yuboring.\n\n"
-            "✨ Slaydlar yaratish uchun @Simplepresentation_maker_bot ni ham sinab ko‘ring!\n\n"
             "💡 /info orqali biz haqimizda yanada ko‘proq bilib olishingiz mumkin."
         ),
         "still_required": (
@@ -130,9 +128,6 @@ SUBSCRIPTION_MESSAGES = {
         "instruction": (
             "Чтобы пользоваться ботом, подпишитесь на наши партнерские каналы ниже 👇\n\n"
             "📌 <i>Это помогает нам поддерживать бот бесплатным и улучшать его.</i>\n\n"
-            "💡 <b>Бонус:</b> Наш новый бот "
-            "@Simplepresentation_maker_bot поможет вам создавать "
-            "презентации, рефераты, курсовые работы, самостоятельные работы, резюме и многое другое автоматически!"
         ),
         "subscribe_btn": "📢 ",
         "check_btn": "✅ Проверить подписку",
@@ -140,7 +135,6 @@ SUBSCRIPTION_MESSAGES = {
             "🎉 <b>Отлично!</b>\n\n"
             "Все готово ✅ Вы можете начать пользоваться ботом.\n\n"
             "👉 Напишите /start, чтобы продолжить.\n\n"
-            "✨ Также рекомендуем попробовать @Simplepresentation_maker_bot для быстрого создания документов!\n\n"
             "💡 С помощью /info вы можете узнать больше о нас."
         ),
         "still_required": (

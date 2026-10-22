@@ -157,20 +157,12 @@ async def send_group_quiz_question(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
         adjusted_quiz_time = quiz_time + 3
 
-        MAX_QUESTION_LENGTH = 280
-        if len(question_base) > MAX_QUESTION_LENGTH:
-            # Send full question text as a separate message first
-            full_question_text = f"<b>{question_number}/{total_questions}:</b> {question_base}"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=full_question_text,
-                parse_mode="HTML"
-            )
-            # Use only the question number in the poll
-            question_text = f"{question_number}/{total_questions}"
-        else:
-            question_text = f"{question_number}/{total_questions}: {question_base}"
-
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=format_question_message(question_number, total_questions, question_base, q["options"]),
+            parse_mode="HTML",
+        )
+        question_text = f"{question_number}/{total_questions}"
         # Final safety check
         if len(question_text) > 300:
             question_text = question_text[:297] + "..."

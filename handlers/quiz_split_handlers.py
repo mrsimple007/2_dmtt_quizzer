@@ -162,6 +162,21 @@ SPLIT_TRANSLATIONS = {
     }
 }
 
+def is_free_user(user_id) -> bool:
+    """IDs may be stored as str or int - compare as strings."""
+    uid = str(user_id).strip()
+    try:
+        from src.imports import FREE_USER_IDS
+        if uid in {str(x).strip() for x in FREE_USER_IDS}:
+            return True
+    except Exception:
+        pass
+    try:
+        from src.imports import is_free_user as _f
+        return bool(_f(user_id) or _f(uid))
+    except Exception:
+        return False
+
 
 def get_translation(language: str, key: str, **kwargs) -> str:
     """Get translation with proper fallback."""
@@ -1081,15 +1096,18 @@ async def confirm_split(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         from payment_integration_new import deduct_balance
         from src.user_management import get_user_balance
         
-        success = await deduct_balance(user_id, split_price*100)
+        if split_price > 0:
+            success = await deduct_balance(user_id, split_price * 100)
+        else:
+            success = True          # free user: nothing to charge
+        if success:
+            charged = split_price * 100
         if not success:
             user_balance = await get_user_balance(user_id)
-            
             balance_msg = get_translation(
-                language,
-                "insufficient_balance",
+                language, "insufficient_balance",
                 price=split_price,
-                balance=user_balance,
+                balance=user_balance // 100,      # was missing // 100
                 total=len(quizzes)
             )
             

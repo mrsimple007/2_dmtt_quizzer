@@ -1,9 +1,11 @@
 from src.tables import TBL
+import re
 import uuid
+from html import escape as esc
 from typing import Optional, Dict
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from src.imports import *
-from src.user_management import get_shared_quiz, get_user_language
+from src.user_management import get_shared_quiz, get_user_language, run_supabase
 from telegram import WebAppInfo
 
 
@@ -94,6 +96,8 @@ SHARING_TRANSLATIONS = {
     }
 }
 
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
 
 def generate_share_link(bot_username: str, quiz_id: str) -> str:
     return f"https://t.me/{bot_username}?start=quiz_{quiz_id}"
@@ -110,8 +114,7 @@ def generate_invite_share_url(join_link: str, invite_text: str) -> str:
 def get_share_quiz_keyboard(bot_username: str, quiz_id: str, language: str = 'en'):
     """Generate share keyboard with language support."""
     t = SHARING_TRANSLATIONS.get(language, SHARING_TRANSLATIONS['en'])
-    link = generate_share_link(bot_username, quiz_id)
-    
+
     keyboard = [
         [InlineKeyboardButton(t['start_quiz'], callback_data=f"start_quiz_{quiz_id}")],
         [InlineKeyboardButton(t['share_quiz'], switch_inline_query=f"quiz_{quiz_id}")],
@@ -123,8 +126,9 @@ def get_share_quiz_keyboard(bot_username: str, quiz_id: str, language: str = 'en
 async def handle_create_1v1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from src.multiplayer_fight import create_multiplayer_room, WEB_APP_URL
     query = update.callback_query
+    # A callback query can be answered only ONCE -> answer it here, report errors as messages.
     await query.answer("⚔️ Creating your battle room...", show_alert=False)
-    
+
     data = query.data
     if data.startswith("create_1v1_"):
         quiz_id = data[len("create_1v1_"):]
@@ -134,12 +138,20 @@ async def handle_create_1v1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = query.from_user.id
+
+    # query.message is None when the button belongs to a message sent via inline mode
+    # -> then answer in the user's private chat with the bot.
+    async def reply(text, **kwargs):
+        if query.message:
+            return await query.message.reply_text(text, **kwargs)
+        return await context.bot.send_message(chat_id=user_id, text=text, **kwargs)
+
     language = await get_user_language(user_id) or 'en'
-    chat_type = query.message.chat.type
+    chat_type = query.message.chat.type if query.message else 'private'
 
     quiz_data = await get_shared_quiz(quiz_id)
     if not quiz_data:
-        await query.answer("❌ Quiz not found!", show_alert=True)
+        await reply("❌ Quiz not found!")
         return
 
     try:
@@ -148,20 +160,19 @@ async def handle_create_1v1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         web_app_url = room_data.get("web_app_url") or f"{WEB_APP_URL}?room={room_id}"
     except Exception as e:
         logger.error(f"Failed to create multiplayer room: {e}")
-        await query.answer("❌ Could not create room. Try again later.", show_alert=True)
+        await reply("❌ Could not create room. Try again later.")
         return
 
-    title = quiz_data.get("title", "Quiz")
+    title = esc(str(quiz_data.get("title", "Quiz")))
     num_questions = len(quiz_data.get("questions", []))
     quiz_time = quiz_data.get("quiz_time", 30)
     bot_username = (await context.bot.get_me()).username
 
     # join_link: deep link that opens the bot in private chat with the join handler
-    # This works in groups too — tapping it opens a DM with the bot, not the raw WebApp URL
     join_link = f"https://t.me/{bot_username}?start=join_battle_{room_id}_{quiz_id}"
 
     t = SHARING_TRANSLATIONS.get(language, SHARING_TRANSLATIONS['en'])
-    
+
     invite_text = t['invite_text']
     share_url = generate_invite_share_url(join_link, invite_text)
 
@@ -196,25 +207,18 @@ async def handle_create_1v1(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         }
 
-        room_text = ROOM_CREATED.get(language, ROOM_CREATED['en'])
-
-        await query.message.reply_text(
-            room_text,
+        await reply(
+            ROOM_CREATED.get(language, ROOM_CREATED['en']),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 # Creator (private chat) opens the WebApp directly
                 [InlineKeyboardButton(t['open_room'], web_app=WebAppInfo(url=web_app_url))],
-                # Share invite opens Telegram share dialog with pre-filled message
                 [InlineKeyboardButton(t['invite'], url=share_url)],
             ])
         )
 
     else:
-        # ── GROUP CHAT ──────────────────────────────────────────────────────
-        # FIX: Use join_link (bot deep link) NOT web_app_url.
-        # web_app_url is a raw https:// link — Telegram can't open WebApps from
-        # plain URLs in groups. The join_link opens the bot in private chat first,
-        # which then shows the proper web_app button to open the battle room.
+        # GROUP CHAT: use join_link (bot deep link), not the raw web_app_url.
         GROUP_ROOM_CREATED = {
             'en': (
                 f"⚔️ <b>Team Battle Started!</b>\n\n"
@@ -242,10 +246,8 @@ async def handle_create_1v1(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         }
 
-        room_text = GROUP_ROOM_CREATED.get(language, GROUP_ROOM_CREATED['en'])
-
-        await query.message.reply_text(
-            room_text,
+        await reply(
+            GROUP_ROOM_CREATED.get(language, GROUP_ROOM_CREATED['en']),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(t['enter_room'], url=join_link)],
@@ -262,7 +264,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = query.from_user.id
     language = await get_user_language(user_id) or 'en'
     t = SHARING_TRANSLATIONS.get(language, SHARING_TRANSLATIONS['en'])
-    
+
     q = query.query.strip()
     logger.info(f"[INLINE QUERY] After strip: '{q}'")
 
@@ -275,28 +277,42 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         is_group_quiz = False
 
     elif q.startswith("battle_"):
-        from src.multiplayer_fight import WEB_APP_URL  
-        parts = q.split("_", 2)
-        if len(parts) == 3:
-            _, room_id, quiz_id = parts
-            web_app_url = f"{WEB_APP_URL}?room={room_id}"
-            quiz_data = await get_shared_quiz(quiz_id)
-            title = quiz_data.get("title", "Quiz") if quiz_data else "Quiz"
-            
-            results.append(
-                InlineQueryResultArticle(
-                    id=str(uuid.uuid4()),
-                    title=f"⚔️ 1v1 Battle: {title}",
-                    description="Tap to join and compete!",
-                    input_message_content=InputTextMessageContent(
-                        message_text=f"⚔️ <b>1v1 Quiz Battle!</b>\n\n<b>{title}</b>\n\nJoin my room and let's see who's smarter! 🧠",
-                        parse_mode="HTML"
-                    ),
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🎮 Join Battle", web_app=WebAppInfo(url=web_app_url))]
-                    ])
-                )
+        # battle_{room_id}_{quiz_id}  - room_id may itself contain "_", so find the UUID instead of split("_")
+        m = _UUID_RE.search(q)
+        room_id = q[len("battle_"):m.start()].rstrip("_") if m else ""
+        if not m or not room_id:
+            await query.answer([])
+            return
+        quiz_id = m.group(0)
+        quiz_data = await get_shared_quiz(quiz_id)
+        if not quiz_data:
+            await query.answer([])
+            return
+
+        title = str(quiz_data.get("title", "Quiz"))
+        bot_username = (await context.bot.get_me()).username
+        # Inline-mode messages cannot carry web_app buttons -> use the bot deep link; the
+        # /start join_battle_ handler then shows the real web_app button in the private chat.
+        join_link = f"https://t.me/{bot_username}?start=join_battle_{room_id}_{quiz_id}"
+
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title=f"⚔️ 1v1 Battle: {title}",
+                description="Tap to join and compete!",
+                input_message_content=InputTextMessageContent(
+                    message_text=f"⚔️ <b>1v1 Quiz Battle!</b>\n\n<b>{esc(title)}</b>\n\nJoin my room and let's see who's smarter! 🧠",
+                    parse_mode="HTML"
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎮 Join Battle", url=join_link)]
+                ])
             )
+        )
+        # IMPORTANT: stop here. Before, the code fell through and ALSO added a normal quiz result.
+        await query.answer(results, cache_time=0)
+        return
+
     elif q.startswith("groupquiz_"):
         quiz_id = q[len("groupquiz_"):]
         is_group_quiz = True
@@ -323,15 +339,17 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer([])
         return
 
-    title = quiz_data.get('title', '📝 Multiple Choice Quiz')
-    summary = quiz_data.get('summary', '')
+    title = str(quiz_data.get('title', '📝 Multiple Choice Quiz'))
+    summary = str(quiz_data.get('summary', ''))
     num_questions = len(quiz_data.get("questions", []))
-    
+
     quiz_time = quiz_data.get("quiz_time")
-    
+
     if quiz_time is None:
         try:
-            quiz_row = supabase.table(TBL.QUIZZES).select("quiz_time").eq("id", quiz_id).execute()
+            # was a blocking call inside an async handler -> run it in the executor like the rest of the bot
+            quiz_row = await run_supabase(
+                lambda: supabase.table(TBL.QUIZZES).select("quiz_time").eq("id", quiz_id).execute())
             if quiz_row.data and len(quiz_row.data) > 0:
                 quiz_time = quiz_row.data[0].get("quiz_time", 30)
             else:
@@ -339,14 +357,16 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.error(f"[INLINE QUERY] Error fetching quiz_time from database: {e}")
             quiz_time = 30
-    
+
     quiz_time = int(quiz_time) if quiz_time else 30
     quiz_info = quiz_data.get('quiz_info', '')
-    quiz_info_display = f"\n\n<b>{t['quiz_info']}</b>\n{quiz_info}" if quiz_info else ""
+    # title / summary / info go into HTML messages -> they must be escaped ("<", "&" would break the message)
+    safe_title, safe_summary = esc(title), esc(summary)
+    quiz_info_display = f"\n\n<b>{t['quiz_info']}</b>\n{esc(str(quiz_info))}" if quiz_info else ""
 
     if is_group_quiz:
         logger.info(f"[INLINE QUERY] Sending group quiz result for quiz_id: {quiz_id}")
-            
+
         results.append(
             InlineQueryResultArticle(
                 id=quiz_id,
@@ -354,8 +374,8 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 description=f"{num_questions} {t['click_to_share']}",
                 input_message_content=InputTextMessageContent(
                     message_text=(
-                        f"{t['group_quiz_title']} {title}\n\n"
-                        f"<b>{t['summary']}</b> {summary}"
+                        f"{t['group_quiz_title']} {safe_title}\n\n"
+                        f"<b>{t['summary']}</b> {safe_summary}"
                         f"{quiz_info_display}\n\n"
                         f"{t['play_together']}\n"
                         f"{t['questions'].format(num=num_questions)}\n"
@@ -377,17 +397,19 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     else:
         logger.info(f"[INLINE QUERY] Sending individual quiz result for quiz_id: {quiz_id}")
-        link = generate_share_link(context.bot.username, quiz_id)
-        
+        bot_username = (await context.bot.get_me()).username
+        link = generate_share_link(bot_username, quiz_id)
+
         quiz_message = (
             f"{t['quiz_ready']}\n\n"
-            f"<b>{title}</b>\n\n"
-            f"<b>{t['summary']}</b> {summary}"
+            f"<b>{safe_title}</b>\n\n"
+            f"<b>{t['summary']}</b> {safe_summary}"
             f"{quiz_info_display}\n\n"
-            f"{t['time_limit']} {quiz_time} seconds per question\n"
+            # was hard-coded English ("seconds per question") for every language
+            f"{t['time_per_question'].format(time=quiz_time)}\n"
             f"{t['num_questions']} {num_questions}"
         )
-        
+
         results.append(
             InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
@@ -400,9 +422,9 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(t['start_quiz'], url=link)],
                     [InlineKeyboardButton(t['share_quiz'], switch_inline_query=f"quiz_{quiz_id}")],
-                    [InlineKeyboardButton(t['share_to_group'], url=f"https://t.me/{context.bot.username}?startgroup=groupquiz_{quiz_id}")]
+                    [InlineKeyboardButton(t['share_to_group'], url=f"https://t.me/{bot_username}?startgroup=groupquiz_{quiz_id}")]
                 ])
             )
         )
-    
+
     await query.answer(results, cache_time=0)
