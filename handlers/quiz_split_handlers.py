@@ -10,6 +10,9 @@ import olefile
 import asyncio
 from datetime import datetime, timezone
 import random
+from handlers.javob_parser import parse_best, SOFT_BREAK
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -305,8 +308,8 @@ async def handle_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             
             for p in doc.paragraphs:
                 if p.text.strip():
-                    content_parts.append(p.text.strip())
-            
+                    content_parts.append(p.text.strip().replace('\n', SOFT_BREAK))
+                        
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
@@ -391,7 +394,7 @@ async def handle_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logger.info(f"[SPLIT] Content length: {len(content)}")
         
         correct_marker = context.user_data.get('correct_marker', '#')
-        quizzes = QuizSplitter.parse_quiz_file(content, correct_marker)
+        quizzes = parse_best(content, correct_marker)
         
         logger.info(f"[SPLIT] Parsed {len(quizzes)} quizzes")
         
@@ -659,7 +662,7 @@ async def handle_quiz_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logger.info(f"[SPLIT] Processing text message, length: {len(content)}")
         
         correct_marker = context.user_data.get('correct_marker', '#')
-        quizzes = QuizSplitter.parse_quiz_file(content, correct_marker)
+        quizzes = parse_best(content, correct_marker)
         
         logger.info(f"[SPLIT] Parsed {len(quizzes)} quizzes from text")
         

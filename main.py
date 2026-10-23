@@ -45,16 +45,25 @@ from telegram.ext import ApplicationHandlerStop
 from src.imports import is_free_user
 
 
-async def free_users_only_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Non-free users get the welcome message only. Everything else is blocked."""
+async def free_users_only_gate(update, context):
     user = update.effective_user
-    if user is None or update.my_chat_member or is_free_user(user.id):
-        return  # let it through
+    chat = update.effective_chat
 
+    # Nothing to gate: no user, or not a private chat (groups pass through)
+    if user is None:
+        return
+    if chat and chat.type != "private":
+        return
+
+    # Whitelisted users and admins go through to the normal handlers
+    if is_free_user(user.id) or user.id in NOTIFICATION_ADMIN_IDS:
+        return
+
+    # Everyone else is blocked
     try:
         if update.callback_query:
-            await update.callback_query.answer()      # just stop the spinner
-        elif update.message and update.effective_chat.type == "private":
+            await update.callback_query.answer()
+        elif update.message:
             from handlers.start_handler import MAIN_MENU_TRANSLATIONS, sanitize_name
             lang = (user.language_code or "uz")[:2]
             if lang not in MAIN_MENU_TRANSLATIONS:
@@ -64,13 +73,12 @@ async def free_users_only_gate(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(
                 text,
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=ReplyKeyboardRemove(),   # removes old menu buttons
+                reply_markup=ReplyKeyboardRemove(),
             )
     except Exception as e:
         logger.warning(f"[GATE] failed for {user.id}: {e}")
 
-    raise ApplicationHandlerStop   # nothing else runs for this update
-
+    raise ApplicationHandlerStop
 
 def _language_keyboard() -> InlineKeyboardMarkup:
     rows = [
@@ -1948,9 +1956,13 @@ def main() -> None:
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)       
-        .connection_pool_size(256)      
-        .pool_timeout(10)
+        .concurrent_updates(True)
+        .connection_pool_size(256)
+        .pool_timeout(30)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .get_updates_read_timeout(30)
         .post_init(_post_init)
         .build()
     )
@@ -2135,6 +2147,10 @@ def main() -> None:
     application.add_handler(TypeHandler(Update, free_users_only_gate), group=-2)
     application.add_handler(TypeHandler(Update, touch_user), group=-1)   # existing line
 
+
+    from handlers.group_sharing import groupquiz_command
+    application.add_handler(CommandHandler("groupquiz", groupquiz_command), group=1)
+    logger.info("✅ /groupquiz handler registered")
     setup_payment_handlers(application)
     setup_share_handlers(application)
     setup_manual_payment_handlers(application)

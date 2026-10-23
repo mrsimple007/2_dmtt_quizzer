@@ -31,6 +31,28 @@ ANTI_CHEAT_GROUP_IDS = {
 }
 
 
+def _tid(chat_id):
+    """Topic (thread) id the quiz was started in, or None."""
+    return GROUP_QUIZ_STATE.get(chat_id, {}).get("thread_id")
+
+
+async def groupquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    logger.info(f"[GROUPQUIZ CMD] chat={chat.id} type={chat.type} args={context.args} "
+                f"thread={msg.message_thread_id}")
+
+    if chat.type == "private":
+        await msg.reply_text("👥 Send this command inside your group:\n/groupquiz <quiz_id>")
+        return
+    if not context.args:
+        await msg.reply_text("Usage: /groupquiz <quiz_id>")
+        return
+
+    thread_id = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
+    await start_group_quiz(context, chat.id, context.args[0], thread_id)
+
+
 async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.my_chat_member.chat
     new_status = update.my_chat_member.new_chat_member.status
@@ -429,12 +451,16 @@ async def reveal_correct_answer(
 
 
 
-async def start_group_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz_id: str) -> None:
+async def start_group_quiz(context, chat_id: int, quiz_id: str, thread_id: int = None) -> None:
     """Initialize and start a new group quiz with a countdown using existing quiz from database."""
     try:
         # Check if there's already an active quiz in this group
         if chat_id in GROUP_QUIZ_STATE and GROUP_QUIZ_STATE[chat_id].get("active", False):
-            logger.warning(f"[GROUP QUIZ] Quiz already active in chat {chat_id}, ignoring duplicate start request")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ A quiz is already running here. Send /stopquiz to stop it.",
+                message_thread_id=GROUP_QUIZ_STATE[chat_id].get("thread_id"),
+            )
             return
 
         logger.info(f"[GROUP QUIZ] Starting quiz {quiz_id} in chat {chat_id}")

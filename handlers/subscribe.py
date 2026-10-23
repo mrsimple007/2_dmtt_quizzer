@@ -352,15 +352,11 @@ async def check_user_subscriptions(user_id: int, context: ContextTypes.DEFAULT_T
 
 
 
-async def force_subscription_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def force_subscription_check(update, context) -> bool:
     if not FORCE_SUBSCRIPTION_ENABLED:
         return True
-    user = update.effective_user
-    if not user:
-        return False
-    if user.id == 200713886:
-        return True
-    if cache_get(("sub_ok", user.id)):          # skips the getChatMember call
+    chat = update.effective_chat
+    if chat and chat.type != "private":
         return True
 
     status = await check_user_subscriptions(user.id, context)

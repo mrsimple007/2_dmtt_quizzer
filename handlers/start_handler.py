@@ -584,9 +584,9 @@ async def start(update, context):
 
         elif args[0].startswith("groupquiz_"):
             quiz_id = args[0][len("groupquiz_"):]
-            logger.info(
-                f"[START] Group quiz deep link. user={user.id}  quiz_id={quiz_id}"
-            )
+            chat = update.effective_chat
+
+            logger.info(f"[START] Group quiz deep link. user={user.id} chat={chat.id} type={chat.type} quiz_id={quiz_id}")
 
             quiz_data = await get_shared_quiz(quiz_id)
             if not quiz_data:
