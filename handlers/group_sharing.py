@@ -53,6 +53,60 @@ async def groupquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_group_quiz(context, chat.id, context.args[0], thread_id)
 
 
+async def handle_group_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Track each user's vote live. Telegram only exposes voters via poll_answer updates."""
+    pa = update.poll_answer
+    if not pa or pa.user is None:
+        return
+
+    # Find the group quiz this poll belongs to
+    chat_id, state = None, None
+    for cid, st in GROUP_QUIZ_STATE.items():
+        if pa.poll_id in st.get("poll_to_question", {}):
+            chat_id, state = cid, st
+            break
+    if state is None:
+        return  # not a group quiz poll
+
+    qd = state["poll_to_question"][pa.poll_id]
+    user_id = pa.user.id
+    question_idx = qd["question_idx"]
+    correct = qd["correct_option_id"]
+    option_ids = list(pa.option_ids)
+
+    state.setdefault("scores", {})
+    state.setdefault("user_answers", {})
+    answers = state["user_answers"].setdefault(user_id, [])
+
+    # Vote retracted (regular/anti-cheat polls allow this)
+    if not option_ids:
+        answers[:] = [a for a in answers if a["question_idx"] != question_idx]
+        state["scores"][user_id] = sum(1 for a in answers if a["is_correct"])
+        return
+
+    if qd.get("allows_multiple"):
+        is_correct = set(option_ids) == set(correct)
+    else:
+        is_correct = option_ids[0] == correct
+
+    elapsed = (datetime.now(timezone.utc) - qd["start_time"]).total_seconds()
+    quiz_time = state.get("quiz_time", 30)
+    elapsed = max(0.1, min(elapsed, quiz_time))
+
+    # Replace any previous answer to the same question (vote changes)
+    answers[:] = [a for a in answers if a["question_idx"] != question_idx]
+    answers.append({
+        "question_idx": question_idx,
+        "user_choice": option_ids,
+        "correct_option": correct,
+        "is_correct": is_correct,
+        "time_spent": elapsed,
+    })
+
+    state["scores"][user_id] = sum(1 for a in answers if a["is_correct"])
+    logger.info(f"[POLL ANSWER] chat={chat_id} user={user_id} q={question_idx + 1} correct={is_correct}")
+
+
 async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.my_chat_member.chat
     new_status = update.my_chat_member.new_chat_member.status
@@ -528,6 +582,7 @@ async def start_group_quiz(context, chat_id: int, quiz_id: str, thread_id: int =
         GROUP_QUIZ_STATE[chat_id] = {
             "active": True,
             "quiz_data": quiz_data,
+            'quiz_id': quiz_id,
             "current_question": 0,
             "scores": {},
             "start_time": datetime.now(timezone.utc),
@@ -748,7 +803,7 @@ async def _send_leaderboard_background(
                     leaderboard += f"\n🎉 Congratulations {winner_name}!"
 
         # Get quiz_id and create share button
-        quiz_id = state.get("quiz_data", {}).get("id")
+        quiz_id = state.get("quiz_id") or state.get("quiz_data", {}).get("id")
         reply_markup = None
                 
         if quiz_id:
@@ -864,7 +919,7 @@ async def _send_leaderboard(
             leaderboard += "\n" + (congrats_text.format(winner=winner_name)
                                    if '{winner}' in congrats_text else f"🎉 Congratulations {winner_name}!")
         # Get quiz_id and create share button
-        quiz_id = state.get("quiz_data", {}).get("id")
+        quiz_id = state.get("quiz_id") or state.get("quiz_data", {}).get("id")
         reply_markup = None
                 
         if quiz_id:
@@ -1036,7 +1091,6 @@ async def handle_poll_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 state["unanswered_count"] = state.get("unanswered_count", 0) + 1
                 logger.info(f"[GROUP QUIZ] Poll closed with no answers, count: {state['unanswered_count']}")
             
-            await calculate_scores(poll, state, context)
         else:
             # Private quiz
             poll_answered = any(option.voter_count > 0 for option in poll.options)

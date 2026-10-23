@@ -10,29 +10,6 @@ Public API (kept compatible with handlers/quiz_split_handlers.py):
     QuizSplitter.calculate_batches(total, size)               -> (num_batches, last_batch_size)
     QuizSplitter.split_quizzes(quizzes, size)                 -> list[list[dict]]
     validate_quiz_structure(quiz)                             -> bool
-
-Every parsed quiz is a dict:
-
-    {
-        "question": str,                 # full text (scenario / matching lists included)
-        "options": [str, ...],           # option letters "A)" are STRIPPED -> shuffling is safe
-        "correct_answer": int | None,    # index into options (None = answer not found)
-        "allows_multiple_answers": False,
-    }
-
-Supported layouts (all can be mixed in one file):
-
-  1. "N. Question?"  A) B) C) D)  + "✅ Javob: X"                       (DMTT best-answer)
-  2. "Savol: ..." + concepts + "a) b) c) d)" + "A) 1-d, 2-c ..." + ✅    (matching)
-  3. "N-SAVOL" / scenario / "Savol: ..." / A) B) C) D) / "To'g'ri javob: X"  (situational)
-  4. "NN. Test type name" / stem / A) B) C) D) / "Javob: X"             (pasted 5-type format)
-  5. Sequence tests: options like "2-3-4-1"
-  6. "N-test" / "Savol:" / "Tushunchalar:" / "Mazmunlar:" / "Javob variantlari:"
-     with the correct option marked by a leading arrow:  "► C) 1-b, 2-a, 3-c"
-
-The correct answer is taken from either an answer line ("Javob: X",
-"To'g'ri javob: X", with or without ✅) or from a marker (✅ ✔ ☑ ✓ ► ▶ ➤ ...) placed
-in front of / behind the option itself.
 """
 
 import logging
@@ -42,18 +19,14 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-MAX_POLL_QUESTION = 300   # Telegram poll limits (informational, used for stats only)
+MAX_POLL_QUESTION = 300
 MAX_POLL_OPTION = 100
 
-# --------------------------------------------------------------------------- #
-#  Character helpers
-# --------------------------------------------------------------------------- #
-_AP = "'’ʻʼ‘`´ʹ"                      # every apostrophe variant seen in Uzbek text
-_MARKS = "✅✔✔️☑✓\ufe0f►▶▸➤➜➔"           # "correct" markers
+_AP = "'’ʻʼ‘`´ʹ"
+_MARKS = "✅✔✔️☑✓\ufe0f►▶▸➤➜➔"
 _RE_MARKS = re.compile("[" + _MARKS + "]")
-_RE_LEAD_MARK = re.compile("^[\\s" + _MARKS + "]+")      # markers standing in front of a line
+_RE_LEAD_MARK = re.compile("^[\\s" + _MARKS + "]+")
 
-# Cyrillic look-alikes that people type by accident in "А) В) С)"
 _CYR = {"А": "A", "В": "B", "С": "C", "Е": "E", "а": "a", "с": "c", "е": "e"}
 
 
@@ -66,34 +39,27 @@ def _strip_marks(text: str) -> Tuple[str, bool]:
     return _RE_MARKS.sub("", text).strip(), found
 
 
-# --------------------------------------------------------------------------- #
-#  Regular expressions
-# --------------------------------------------------------------------------- #
-# "Javob: A", "✅ Javob: A", "To'g'ri javob: A", "To‘g‘ri javob – A"
 _RE_ANS = re.compile(
     r"^\W*(?:to[" + _AP + r"]?g[" + _AP + r"]?ri\s+)?javob\s*[:：\-–—]\s*\(?\s*([A-Fa-fАВСЕасе])\b",
     re.IGNORECASE,
 )
-
-# Options use CAPITAL letters, matching items use lowercase.  "." is only accepted
-# when followed by whitespace (protects "e.g." and initials).
 _RE_OPT = re.compile(r"^\(?\s*([A-FАВСЕ])\s*([\)\]]|\.(?=\s))\s*(.*)$")
 _RE_ITEM = re.compile(r"^\(?\s*([a-fасе])\s*([\)\]]|\.(?=\s))\s*(.*)$")
 
 _RE_SAVOL = re.compile(r"^\s*savol\s*\d*\s*[:：]\s*(.*)$", re.IGNORECASE)
-_RE_NSAVOL = re.compile(r"^\s*(\d{1,4})\s*[-–.]?\s*savol\s*[:.]?\s*$", re.IGNORECASE)      # "31-SAVOL"
-_RE_NTEST = re.compile(r"^\s*(\d{1,4})\s*[-–]\s*test\s*$", re.IGNORECASE)                  # "13-test" (noise)
-_RE_TYPE_HDR = re.compile(                                                                 # "12. Murakkab moslashtirish testi"
+_RE_NSAVOL = re.compile(r"^\s*(\d{1,4})\s*[-–.]?\s*savol\s*[:.]?\s*$", re.IGNORECASE)
+_RE_NTEST = re.compile(r"^\s*(\d{1,4})\s*[-–]\s*test\s*$", re.IGNORECASE)
+_RE_TYPE_HDR = re.compile(
     r"^\s*(\d{1,4})\s*[\.\)]\s*([^?:]{3,70}?\btest(?:i)?)\s*$", re.IGNORECASE)
-_RE_NUMQ = re.compile(r"^\s*(\d{1,4})\s*[\.\)]\s+(\S.*)$")                                 # "7. Question?"
-_RE_LABEL = re.compile(r"^[^\W\d][^:]{1,38}:$")                                            # "Mazmunlar:"
+_RE_NUMQ = re.compile(r"^\s*(\d{1,4})\s*[\.\)]\s+(\S.*)$")
+_RE_LABEL = re.compile(r"^[^\W\d][^:]{1,38}:$")
 _RE_GLUED_LABEL = re.compile(
     r"\s+(tu[sh]?h?unchalar|kompetensiyalar|tamoyillar|bosqichlar|jarayonlar|atamalar)\s*:\s*$",
     re.IGNORECASE)
 
-_RE_PAIRS_NOISE = re.compile(r"^(?:\d\s*[-–—]\s*[a-fA-F]\s*[,;]?\s*){3,}$")                # stray "1-d, 2-a, 3-b, 4-c"
-_RE_MATCH_OPT = re.compile(r"^\d\s*[-–—]\s*[a-fA-F](?:\s*[,;]?\s*\d\s*[-–—]\s*[a-fA-F])+$")  # option of a matching test
-_RE_SEQ_OPT = re.compile(r"^\d(?:\s*[-–—→>,;]\s*\d){2,}$")                                 # option of a sequence test "2–3–4–1"
+_RE_PAIRS_NOISE = re.compile(r"^(?:\d\s*[-–—]\s*[a-fA-F]\s*[,;]?\s*){3,}$")
+_RE_MATCH_OPT = re.compile(r"^\d\s*[-–—]\s*[a-fA-F](?:\s*[,;]?\s*\d\s*[-–—]\s*[a-fA-F])+$")
+_RE_SEQ_OPT = re.compile(r"^\d(?:\s*[-–—→>,;]\s*\d){2,}$")
 _RE_VARIANTS = re.compile(r"^javob\s+variantlari\s*:?$|^variantlar\s*:?$", re.IGNORECASE)
 _RE_PATH = re.compile(r"(/Users/|Library/Containers|^\S+\.docx?$)", re.IGNORECASE)
 _RE_FILLER = re.compile(r"^[-=+_*~#.\s]{3,}$")
@@ -105,39 +71,32 @@ _KNOWN_LABELS = {
 _RE_LIST_INTRO = re.compile(r"moslashtir|joylashtir|tartib|ketma-ket", re.IGNORECASE)
 
 
-# --------------------------------------------------------------------------- #
-#  Internal block (one question while it is being collected)
-# --------------------------------------------------------------------------- #
 class _Block:
     __slots__ = ("parts", "items", "options", "correct", "ans_letter",
                  "closed", "num", "last_listed")
 
     def __init__(self, num: Optional[int] = None):
-        self.parts: List[Tuple[str, str]] = []   # (kind, text): text | savol | list | label
-        self.items: List[str] = []               # lowercase a) b) c) d) items (matching tests)
-        self.options: List[str] = []             # A) B) C) D) option texts
-        self.correct: Optional[int] = None       # from a marker on an option
-        self.ans_letter: Optional[str] = None    # from "Javob: X"
-        self.closed = False                      # answer line already consumed
+        self.parts: List[Tuple[str, str]] = []
+        self.items: List[str] = []
+        self.options: List[str] = []
+        self.correct: Optional[int] = None
+        self.ans_letter: Optional[str] = None
+        self.closed = False
         self.num = num
-        self.last_listed: Optional[int] = None   # last typed "1. 2. 3." concept number
+        self.last_listed: Optional[int] = None
 
 
-# --------------------------------------------------------------------------- #
-#  QuizSplitter
-# --------------------------------------------------------------------------- #
 class QuizSplitter:
     last_warnings: List[str] = []
     last_stats: Dict[str, int] = {}
 
-    # ------------------------------ public API ------------------------------ #
     @classmethod
     def parse_quiz_file(cls, content: str, correct_marker: str = "#") -> List[Dict]:
         cls.last_warnings = []
         cls.last_stats = {"questions": 0, "long_questions": 0, "long_options": 0, "no_answer": 0}
         try:
             return cls._parse(content or "", correct_marker or "")
-        except Exception as e:  # never crash the bot because of a weird file
+        except Exception as e:
             logger.error(f"[QuizSplitter] parse failed: {e}", exc_info=True)
             return []
 
@@ -157,7 +116,6 @@ class QuizSplitter:
 
     @staticmethod
     def split_quizzes(quizzes: List[Dict], size: int) -> List[List[Dict]]:
-        """Consecutive chunks - the original order is kept (important for learning)."""
         if not quizzes:
             return []
         if size <= 0 or size > len(quizzes):
@@ -185,12 +143,11 @@ class QuizSplitter:
             cur = _Block(num)
             return cur
 
-        for raw in text.split("\n"):
+        for raw in cls._expand_lines(text):          # <-- FIX 1
             ln = cls._clean(raw)
             if not ln:
                 continue
 
-            # 1) answer line ------------------------------------------------
             m = _RE_ANS.match(ln)
             if m:
                 if cur is not None and cur.options:
@@ -198,7 +155,6 @@ class QuizSplitter:
                     cur.closed = True
                 continue
 
-            # 1b) marker in FRONT of an option:  "► C) ...", "✅ B) ..."  --------
             lead_marked = False
             lm = _RE_LEAD_MARK.match(ln)
             if lm and lm.end() > 0 and _RE_MARKS.search(lm.group(0)):
@@ -206,7 +162,6 @@ class QuizSplitter:
                 if _RE_OPT.match(rest):
                     ln, lead_marked = rest, True
 
-            # 2) block headers ("31-SAVOL", "12. Murakkab ... testi") ---------
             m = _RE_NSAVOL.match(ln)
             if m:
                 start(int(m.group(1)))
@@ -216,7 +171,6 @@ class QuizSplitter:
                 start(int(m.group(1)))
                 continue
 
-            # 3) option  A) B) C) D) ------------------------------------------
             m = _RE_OPT.match(ln)
             if m:
                 letter = _norm_letter(m.group(1))
@@ -229,7 +183,7 @@ class QuizSplitter:
                     if cur is None:
                         cur = _Block()
                 elif letter == "A" and n_opts > 0 and sep != ".":
-                    start()                       # options of a new, stem-less question
+                    start()
                     accept = True
                 if accept:
                     body, has_mark = _strip_marks(m.group(3))
@@ -240,9 +194,7 @@ class QuizSplitter:
                     if has_mark:
                         cur.correct = len(cur.options) - 1
                     continue
-                # else: not a real option -> falls through as plain text
 
-            # 4) "Savol: ..." ---------------------------------------------------
             m = _RE_SAVOL.match(ln)
             if m:
                 body = m.group(1).strip()
@@ -260,7 +212,6 @@ class QuizSplitter:
                     cur.parts.append(("savol", body))
                 continue
 
-            # 5) lowercase matching item  a) b) c) d) --------------------------
             m = _RE_ITEM.match(ln)
             if m and cur is not None and not cur.options:
                 letter = _norm_letter(m.group(1))
@@ -269,7 +220,6 @@ class QuizSplitter:
                     cur.items.append(_strip_marks(m.group(3))[0])
                     continue
 
-            # 6) numbered line "7. ..."  (new question OR typed concept list) --
             m = _RE_NUMQ.match(ln)
             if m:
                 num, body = int(m.group(1)), _strip_marks(m.group(2))[0]
@@ -281,7 +231,6 @@ class QuizSplitter:
                     cur.last_listed = num
                 continue
 
-            # 7) label line ("Mazmunlar:", "Tushunchalar:") ---------------------
             if _RE_LABEL.match(ln):
                 if cur is None:
                     start()
@@ -289,20 +238,19 @@ class QuizSplitter:
                     cur.parts.append(("label", ln[:-1].strip()))
                 continue
 
-            # 8) plain text ------------------------------------------------------
             if cur is None:
                 start().parts.append(("text", _strip_marks(ln)[0]))
                 continue
             if cur.options:
                 if cur.closed or (cur.correct is not None and len(cur.options) >= 4):
-                    start().parts.append(("text", _strip_marks(ln)[0]))   # next question, no header
-                else:                                                    # wrapped option text
+                    start().parts.append(("text", _strip_marks(ln)[0]))
+                else:
                     body, has_mark = _strip_marks(ln)
                     cur.options[-1] = (cur.options[-1] + " " + body).strip()
                     if has_mark:
                         cur.correct = len(cur.options) - 1
                 continue
-            if cur.items:                                                # wrapped item text
+            if cur.items:
                 cur.items[-1] = (cur.items[-1] + " " + _strip_marks(ln)[0]).strip()
                 continue
             cur.parts.append(("text", _strip_marks(ln)[0]))
@@ -313,12 +261,55 @@ class QuizSplitter:
 
     # ------------------------------ helpers --------------------------------- #
     @staticmethod
+    def _expand_lines(text: str) -> List[str]:
+        """Turn soft breaks into real newlines and split inline
+        'Label: a) .. b) .. c) ..' lines into separate lines."""
+        breaks = ["\u2028", "\u2029", "\u000b", "\u0085"]
+        try:
+            from handlers.javob_parser import SOFT_BREAK     # lazy: avoids circular import
+            if SOFT_BREAK:
+                breaks.append(SOFT_BREAK)
+        except Exception:
+            pass
+        for b in breaks:
+            text = text.replace(b, "\n")
+
+        # Fallback when the soft-break marker is unknown: whatever junk sits between
+        # "Mazmunlar:" and "a)" is the separator -> split the whole line on it.
+        lines: List[str] = []
+        for raw in text.split("\n"):
+            ms = re.match(r"^\s*[^\W\d][^:]{1,38}:([^\w\s]{1,30}\w{0,6}[^\w\s]{1,30})a[\)\]]\s", raw)
+            if ms and ms.group(1):
+                lines.extend(raw.split(ms.group(1)[:]) if False else raw.replace(ms.group(1), "\n").split("\n"))
+            else:
+                lines.append(raw)
+
+        out: List[str] = []
+        for raw in lines:
+            m = re.match(r"^\s*(?:([^\W\d][^:]{1,38}:)\s*)?(a[\)\]]\s.*)$", raw)
+            if not m:
+                out.append(raw)
+                continue
+            body = m.group(2)
+            seq: List[int] = []
+            for mm in re.finditer(r"(?:(?<=\s)|^)([a-f])[\)\]]\s", body):
+                if mm.group(1) == chr(97 + len(seq)):
+                    seq.append(mm.start())
+            if len(seq) < 2:
+                out.append(raw)
+                continue
+            if m.group(1):
+                out.append(m.group(1))
+            seq.append(len(body))
+            out.extend(body[seq[i]:seq[i + 1]].strip() for i in range(len(seq) - 1))
+        return out
+
+    @staticmethod
     def _clean(raw: str) -> Optional[str]:
-        """Return a cleaned line, or None for empty / noise lines."""
         ln = raw.replace("\u00a0", " ").replace("\u200b", "").replace("\t", " ").strip()
         if not ln:
             return None
-        if ln.startswith(">"):                                  # pasted Telegram quote: "> IHulkar:"
+        if ln.startswith(">"):
             ln = ln.lstrip("> ").strip()
             if not ln:
                 return None
@@ -333,7 +324,6 @@ class QuizSplitter:
 
     @staticmethod
     def _is_listed(cur: _Block, num: int) -> bool:
-        """Is this numbered line a typed concept (1. 2. 3.) of the current stem?"""
         if not cur.parts:
             return False
         kind, text = cur.parts[-1]
@@ -356,7 +346,6 @@ class QuizSplitter:
                 cls.last_warnings.append(f"#{idx}: skipped, fewer than 2 options")
             return None
 
-        # ---- correct answer ----
         correct = blk.correct
         if blk.ans_letter:
             from_line = ord(blk.ans_letter) - 65
@@ -369,9 +358,6 @@ class QuizSplitter:
             cls.last_stats["no_answer"] += 1
             correct = None
 
-        # Telegram needs unique poll options.  Some files repeat the correct option under
-        # two letters ("C) 1-c, 2-a, 3-b" and "► D) 1-c, 2-a, 3-b") -> merge identical options
-        # and keep the marked one, so the answer stays unambiguous.
         keep: List[int] = []
         pos: Dict[str, int] = {}
         for i, o in enumerate(opts):
@@ -425,20 +411,27 @@ class QuizSplitter:
         if not (is_match or is_seq or blk.items):
             return cls._compose_plain(blk)
 
-        # ---------- list-type question: sentence + numbered concepts (+ a) b) c) d) items) ----------
+        # <-- FIX 3: concepts are taken by label position, not "last k lines"
         parts = blk.parts
+        label_pos = [i for i, (kd, _) in enumerate(parts) if kd == "label"]
         mz_label = None
-        label_entries = [(i, t) for i, (kd, t) in enumerate(parts) if kd == "label"]
         if blk.items and parts and parts[-1][0] == "label":
             mz_label = parts[-1][1]
-            label_entries = label_entries[:-1]
-        concept_label = label_entries[0][1] if label_entries else None
+            label_pos = label_pos[:-1]
+        concept_label = parts[label_pos[0]][1] if label_pos else None
 
-        content = [(kd, t) for kd, t in parts if kd != "label"]
-        cand = [i for i, (kd, _) in enumerate(content) if kd in ("text", "list")]
-        concept_idx = cand[-k:] if (k and len(cand) >= k) else cand
-        concepts = [content[i][1] for i in concept_idx]
-        sentence = " ".join(t for i, (kd, t) in enumerate(content) if i not in concept_idx).strip()
+        concept_idx = set()
+        if label_pos:
+            s = label_pos[0]
+            e = label_pos[1] if len(label_pos) > 1 else len(parts)
+            concept_idx = {i for i in range(s + 1, e) if parts[i][0] in ("text", "list")}
+        if not concept_idx:
+            cand = [i for i, (kd, _) in enumerate(parts) if kd in ("text", "list")]
+            concept_idx = set(cand[-k:] if (k and len(cand) >= k) else cand)
+
+        concepts = [parts[i][1] for i in sorted(concept_idx)]
+        sentence = " ".join(t for i, (kd, t) in enumerate(parts)
+                            if kd in ("text", "savol") and i not in concept_idx).strip()
 
         sections: List[str] = []
         if sentence:
@@ -483,11 +476,7 @@ class QuizSplitter:
         return scenario or question
 
 
-# --------------------------------------------------------------------------- #
-#  Validation (imported by quiz_split_handlers)
-# --------------------------------------------------------------------------- #
 def validate_quiz_structure(quiz: Dict) -> bool:
-    """True when the quiz has a question, >= 2 options and a valid correct answer."""
     try:
         if not quiz or len((quiz.get("question") or "").strip()) < 3:
             return False

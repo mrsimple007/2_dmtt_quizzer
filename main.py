@@ -46,8 +46,13 @@ from src.imports import is_free_user
 
 
 async def free_users_only_gate(update, context):
+    # Votes, poll updates, chat-member events etc. are not "private chat usage"
+    if update.poll_answer or update.poll or update.my_chat_member or update.chat_member:
+        return
+
     user = update.effective_user
     chat = update.effective_chat
+
 
     # Nothing to gate: no user, or not a private chat (groups pass through)
     if user is None:
@@ -1690,6 +1695,8 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         poll_answer = update.poll_answer
         user_id = poll_answer.user.id
         poll_id = poll_answer.poll_id
+        if any(poll_id in s.get("poll_to_question", {}) for s in GROUP_QUIZ_STATE.values()):
+            return  # group quiz votes are handled by handle_group_poll_answer
         answer_time = datetime.now(timezone.utc)
         
         group_quiz_found = False
@@ -2145,8 +2152,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_quiz_time_menu, pattern=r"^qt_menu_"))
     application.add_handler(CallbackQueryHandler(handle_quiz_time_set, pattern=r"^qt_set_"))
     application.add_handler(TypeHandler(Update, free_users_only_gate), group=-2)
-    application.add_handler(TypeHandler(Update, touch_user), group=-1)   # existing line
-
+    application.add_handler(PollAnswerHandler(handle_group_poll_answer), group=3)
 
     from handlers.group_sharing import groupquiz_command
     application.add_handler(CommandHandler("groupquiz", groupquiz_command), group=1)
